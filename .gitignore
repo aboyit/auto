@@ -218,3 +218,29 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Local environments, runtime logs, personal data, tests and build outputs
+.venv/
+release/
+platform-tools/
+data/*
+!data/.gitkeep
+data/logs/
+*.log
+*.exe
+*.dll
+*.pyd
+*.whl
+__pycache__/
+*.py[cod]
+**/tests/
+**/test/
+**/testing/
+**/test_*.py
+**/*_test.py
+**/*.test.*
+**/*.spec.*
+**/build/
+**/dist/
+**/coverage/
+frontend/node_modules/
+frontend/*.tsbuildinfo
