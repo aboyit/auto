@@ -290,8 +290,9 @@ export function routeConnections(nodes: RoutingNode[], connections: RoutingConne
       const swap = trueTarget && falseTarget ? trueTarget.x > falseTarget.x
         : trueTarget ? trueTarget.x > source.x + source.width / 2
           : falseTarget ? falseTarget.x < source.x + source.width / 4 : false;
-      const isLeft = conn.branch === 'true' ? !swap : Boolean(swap);
-      sourcePort = port(source, 'bottom', isLeft ? 60 : 180);
+      // Match the rendered branch badges: true/false swap sides only when both targets are known.
+      const branchX = conn.branch === 'true' ? (swap ? 180 : 60) : conn.branch === 'false' ? (swap ? 60 : 180) : 180;
+      sourcePort = port(source, 'bottom', branchX);
     } else sourcePort = port(source, self || above || sameRowRight ? 'right' : 'bottom');
     const targetPort = port(target, below ? 'top' : sameRowRight && !self ? 'left' : 'right');
     const rank = ranks.get(target.id) || 0;

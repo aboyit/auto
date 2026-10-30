@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import type { Point, StepPoint, BoxRegion } from '../../types';
 import type { Scenario, ScenarioStep, ActionType } from '../../types/scenario';
-import { ActionDropdown } from './ActionDropdown';
+import { ACTION_GROUPS, ActionDropdown } from './ActionDropdown';
 import { CoordinatePicker } from './CoordinatePicker';
 import { computeOptimalLayout } from './graphAutoLayout';
 import { routeConnections, connectionKey } from './graphRouting';
@@ -58,6 +58,10 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
 
   // Thu phóng sơ đồ (Zoom In / Out)
   const [canvasZoom, setCanvasZoom] = useState<number>(1.0);
+  const [canvasContextMenu, setCanvasContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const canvasContextMenuRef = useRef<{ x: number; y: number } | null>(null);
+  const canvasContextMenuElementRef = useRef<HTMLDivElement>(null);
+  const panStateRef = useRef<{ pointerX: number; pointerY: number; scrollLeft: number; scrollTop: number } | null>(null);
 
   // Kéo thả mũi tên nối thủ công (Manual Arrow Drag & Drop Connection)
   const [connectingFrom, setConnectingFrom] = useState<{ stepId: string; branch: 'default' | 'true' | 'false' } | null>(null);
@@ -66,6 +70,27 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
   const [connectingMousePos, setConnectingMousePos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const canvasInnerRef = useRef<HTMLDivElement>(null);
   const canvasViewportRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handlePanMove = (event: MouseEvent) => {
+      const pan = panStateRef.current;
+      const viewport = canvasViewportRef.current;
+      if (!pan || !viewport) return;
+      viewport.scrollLeft = pan.scrollLeft - (event.clientX - pan.pointerX);
+      viewport.scrollTop = pan.scrollTop - (event.clientY - pan.pointerY);
+    };
+    const handlePanEnd = () => {
+      if (!panStateRef.current) return;
+      panStateRef.current = null;
+      if (canvasViewportRef.current) canvasViewportRef.current.style.cursor = '';
+    };
+    window.addEventListener('mousemove', handlePanMove);
+    window.addEventListener('mouseup', handlePanEnd);
+    return () => {
+      window.removeEventListener('mousemove', handlePanMove);
+      window.removeEventListener('mouseup', handlePanEnd);
+    };
+  }, []);
 
   // Trạng thái theo dõi tiến trình chạy thời gian thực (Realtime Progress Tracker)
   const [execState, setExecState] = useState<{
@@ -313,7 +338,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
   };
 
   // Thêm một bước hành động vào kịch bản đang chọn
-  const handleAddStep = (type: ActionType) => {
+  const handleAddStep = (type: ActionType, position?: { x: number; y: number }) => {
     if (!activeScenario) return;
 
     const newStep: ScenarioStep = {
@@ -323,6 +348,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
       enabled: true,
       repeat_count: 1,
       repeat_delay: 0.5,
+      ...(position ? { node_x: position.x, node_y: position.y } : {}),
     };
 
     if (type === 'if_template') {
@@ -418,6 +444,48 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
     updateActiveScenario((prev) => ({ ...prev, steps }));
   };
 
+  const handleCanvasContextMenu = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (viewMode !== 'n8n' || !canvasViewportRef.current) return;
+    event.preventDefault();
+    const rect = canvasViewportRef.current.getBoundingClientRect();
+    const position = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    canvasContextMenuRef.current = position;
+    setCanvasContextMenu(position);
+  };
+
+  const handleCanvasContextMenuOutside = (event: MouseEvent) => {
+    if (canvasContextMenuElementRef.current && !canvasContextMenuElementRef.current.contains(event.target as Node)) {
+      canvasContextMenuRef.current = null;
+      setCanvasContextMenu(null);
+    }
+  };
+
+  const handleCanvasMenuWheel = () => {
+    canvasContextMenuRef.current = null;
+    setCanvasContextMenu(null);
+  };
+
+  useEffect(() => {
+    if (!canvasContextMenu) return;
+    window.addEventListener('mousedown', handleCanvasContextMenuOutside);
+    window.addEventListener('wheel', handleCanvasMenuWheel, { once: true });
+    return () => {
+      window.removeEventListener('mousedown', handleCanvasContextMenuOutside);
+      window.removeEventListener('wheel', handleCanvasMenuWheel);
+    };
+  }, [canvasContextMenu]);
+
+  const addStepFromCanvasMenu = (type: ActionType) => {
+    const viewport = canvasViewportRef.current;
+    const menuPosition = canvasContextMenuRef.current;
+    if (!viewport || !menuPosition) return;
+    const x = Math.max(16, Math.round((menuPosition.x + viewport.scrollLeft - 16) / canvasZoom));
+    const y = Math.max(16, Math.round((menuPosition.y + viewport.scrollTop - 16) / canvasZoom));
+    canvasContextMenuRef.current = null;
+    setCanvasContextMenu(null);
+    handleAddStep(type, { x, y });
+  };
+
   // Xóa một bước
   const handleDeleteStep = (stepId: string) => {
     if (!activeScenario) return;
@@ -504,6 +572,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
     if (connectingFromId) return;
     const target = e.target as HTMLElement;
     if (target.closest('button') || target.closest('input') || target.closest('select')) {
+      panStateRef.current = null;
       return;
     }
     e.preventDefault();
@@ -528,10 +597,12 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
         ...prev,
         steps: prev.steps.map((st) => (st.id === draggedNodeId ? { ...st, node_x: newX, node_y: newY } : st)),
       }));
+
     };
 
     const handleMouseUp = () => {
       setDraggedNodeId(null);
+      panStateRef.current = null;
     };
 
     window.addEventListener('mousemove', handleMouseMove);
@@ -645,7 +716,8 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
       }
     };
 
-    const handleMouseUp = () => {
+    const handleMouseUp = (event: MouseEvent) => {
+      if (event.button === 2) return;
       setConnectingFrom(null);
     };
 
@@ -1563,21 +1635,29 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
               </span>
             </div>
 
-            {/* Quick Add Action Toolbar - Listdown Dropdown Mode */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', borderBottom: '1px solid #1e293b' }}>
-              <ActionDropdown onSelectAction={handleAddStep} />
-              <span style={{ fontSize: 11, color: '#64748b' }}>
-                Bấm nút menu trên để chọn hành động thêm vào quy trình
-              </span>
-            </div>
+            {viewMode === 'list' && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', borderBottom: '1px solid #1e293b' }}>
+                <ActionDropdown onSelectAction={handleAddStep} />
+                <span style={{ fontSize: 11, color: '#64748b' }}>Thêm hành động vào kịch bản</span>
+              </div>
+            )}
 
             {/* Steps Rendering Area: Free n8n Canvas vs List View */}
             {viewMode === 'n8n' ? (
               <div
                 ref={canvasViewportRef}
+                onContextMenu={handleCanvasContextMenu}
                 onWheel={(event) => {
                   const delta = event.deltaY < 0 ? 0.08 : -0.08;
                   setCanvasZoom((prev) => Math.min(2.0, Math.max(0.1, Math.round((prev + delta) * 100) / 100)));
+                }}
+                onMouseDown={(event) => {
+                  if (event.button !== 0 || event.target !== event.currentTarget) return;
+                  const viewport = canvasViewportRef.current;
+                  if (!viewport) return;
+                  panStateRef.current = { pointerX: event.clientX, pointerY: event.clientY, scrollLeft: viewport.scrollLeft, scrollTop: viewport.scrollTop };
+                  viewport.style.cursor = 'grabbing';
+                  event.preventDefault();
                 }}
                 style={{
                   flex: 1,
@@ -1590,11 +1670,24 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                   padding: 16,
                 }}
               >
-
-
+                {canvasContextMenu && (
+                  <div ref={canvasContextMenuElementRef} style={{ position: 'fixed', left: Math.min(window.innerWidth - 380, (canvasViewportRef.current?.getBoundingClientRect().left ?? 0) + canvasContextMenu.x), top: Math.min(window.innerHeight - 480, (canvasViewportRef.current?.getBoundingClientRect().top ?? 0) + canvasContextMenu.y), zIndex: 12001, width: 360, maxHeight: 460, overflowY: 'auto', background: 'rgba(15, 23, 42, 0.98)', border: '1px solid #334155', borderRadius: 8, boxShadow: '0 16px 36px -4px rgba(0,0,0,.85)', padding: '6px 0' }}>
+                      <div style={{ padding: '8px 12px', borderBottom: '1px solid #1e293b', color: '#38bdf8', fontSize: 11, fontWeight: 800 }}>CHỌN HÀNH ĐỘNG ĐỂ THÊM TẠI ĐÂY</div>
+                      {ACTION_GROUPS.map((group) => (
+                        <div key={group.category}>
+                          <div style={{ padding: '5px 12px', color: '#64748b', fontSize: 9, fontWeight: 800 }}>{group.category}</div>
+                          {group.items.map((item) => (
+                            <button key={item.type} type="button" onClick={() => addStepFromCanvasMenu(item.type)} style={{ display: 'flex', width: '100%', alignItems: 'center', gap: 10, padding: '8px 12px', border: 0, borderBottom: '1px solid rgba(30,41,59,.4)', background: 'transparent', color: item.color, cursor: 'pointer', textAlign: 'left' }}>
+                              <span>{item.icon}</span><span style={{ fontWeight: 700 }}>{item.name}</span>
+                            </button>
+                          ))}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 {activeScenario.steps.length === 0 ? (
                   <div style={{ textAlign: 'center', padding: '60px 0', color: '#64748b', fontSize: 13 }}>
-                    Kịch bản chưa có hành động nào. Nhấn các nút <strong>+ THÊM HÀNH ĐỘNG</strong> ở trên để tạo quy trình!
+                    Kịch bản chưa có hành động nào. Nhấp chuột phải vào vùng workflow để thêm hành động.
                   </div>
                 ) : (
                   <div style={{
@@ -1824,16 +1917,28 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                         let c2x = endX - 40;
                         let c2y = endY;
 
+                        const sourceIsConditional = sourceStep.type === 'if_template' || sourceStep.type === 'run_scenario';
+                        const liveSwap = sourceIsConditional && (() => {
+                          const sourceNode = sourceStep;
+                          const trueTarget = activeScenario.connections?.find((c) => c.from_id === sourceNode.id && c.branch === 'true');
+                          const falseTarget = activeScenario.connections?.find((c) => c.from_id === sourceNode.id && c.branch === 'false');
+                          const trueStep = trueTarget && activeScenario.steps.find((step) => step.id === trueTarget.to_id);
+                          const falseStep = falseTarget && activeScenario.steps.find((step) => step.id === falseTarget.to_id);
+                          if (trueStep && falseStep) return getNodePos(trueStep, activeScenario.steps.indexOf(trueStep)).x > getNodePos(falseStep, activeScenario.steps.indexOf(falseStep)).x;
+                          if (trueStep) return getNodePos(trueStep, activeScenario.steps.indexOf(trueStep)).x > p1.x + 120;
+                          if (falseStep) return getNodePos(falseStep, activeScenario.steps.indexOf(falseStep)).x < p1.x + 60;
+                          return false;
+                        })();
                         const isMouseBelow = endY >= p1.y + 100;
 
-                        if (sourceStep.type === 'if_template' || sourceStep.type === 'run_scenario') {
+                        if (sourceIsConditional) {
                           if (connectingBranch === 'true') {
-                            startX = p1.x + 60;
+                            startX = p1.x + (liveSwap ? 180 : 60);
                             startY = p1.y + 172;
                             strokeColor = '#22c55e';
                             markerUrl = 'url(#n8n-arr-green)';
                           } else if (connectingBranch === 'false') {
-                            startX = p1.x + 180;
+                            startX = p1.x + (liveSwap ? 60 : 180);
                             startY = p1.y + 172;
                             strokeColor = '#f43f5e';
                             markerUrl = 'url(#n8n-arr-red)';
@@ -2067,7 +2172,13 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                       return (
                         <div
                           key={step.id}
-                          onMouseDown={(e) => handleNodeMouseDown(e, step.id, pos)}
+                          onMouseDown={(e) => {
+                            if (e.button === 0 && !connectingFromId) {
+                              const viewport = canvasViewportRef.current;
+                              if (viewport) panStateRef.current = { pointerX: e.clientX, pointerY: e.clientY, scrollLeft: viewport.scrollLeft, scrollTop: viewport.scrollTop };
+                            }
+                            handleNodeMouseDown(e, step.id, pos);
+                          }}
                           onMouseUp={(e) => {
                             if (connectingFromId && connectingFromId !== step.id) {
                               handleEndConnect(e, step.id);
@@ -2110,12 +2221,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                           {(hasLeftIn || connectingFromId) && (
                             <div
                               onMouseUp={(e) => handleEndConnect(e, step.id)}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                if (connectingFromId && connectingFromId !== step.id) {
-                                  handleAddConnection(connectingFromId, step.id, connectingBranch);
-                                }
-                              }}
+                              onClick={(e) => e.stopPropagation()}
                               style={{
                                 width: 11,
                                 height: 11,
@@ -2146,12 +2252,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                           {(hasTopIn || connectingFromId) && (
                             <div
                               onMouseUp={(e) => handleEndConnect(e, step.id)}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                if (connectingFromId && connectingFromId !== step.id) {
-                                  handleAddConnection(connectingFromId, step.id, connectingBranch);
-                                }
-                              }}
+                              onClick={(e) => e.stopPropagation()}
                               style={{
                                 width: 11,
                                 height: 11,
@@ -2182,12 +2283,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                           {(hasRightIn || connectingFromId) && (
                             <div
                               onMouseUp={(e) => handleEndConnect(e, step.id)}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                if (connectingFromId && connectingFromId !== step.id) {
-                                  handleAddConnection(connectingFromId, step.id, connectingBranch);
-                                }
-                              }}
+                              onClick={(e) => e.stopPropagation()}
                               style={{
                                 width: 11,
                                 height: 11,
@@ -2256,7 +2352,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                                     e.stopPropagation();
                                     if (isTrueActive) {
                                       setConnectingFrom(null);
-                                    } else {
+                                    } else if (!connectingFromId) {
                                       handleStartConnect(e, step.id, 'true');
                                     }
                                   }}
@@ -2294,7 +2390,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                                     e.stopPropagation();
                                     if (isFalseActive) {
                                       setConnectingFrom(null);
-                                    } else {
+                                    } else if (!connectingFromId) {
                                       handleStartConnect(e, step.id, 'false');
                                     }
                                   }}
