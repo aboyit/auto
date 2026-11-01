@@ -9,7 +9,7 @@ interface AutoPanelProps {
   onStop: () => void;
   isRunning: boolean;
   activePickingLabel?: string | null;
-  onStartPick: (label: string, onPicked: (p: Point, box?: BoxRegion) => void, previousSteps?: StepPoint[]) => void;
+  onStartPick: (label: string, onPicked: (p: Point, box?: BoxRegion) => void, previousSteps?: StepPoint[], mode?: 'swipe') => void;
   onCancelPick: () => void;
   navigatingLabel?: string | null;
   onTestClick?: (label: string, point: Point) => void;
@@ -18,6 +18,7 @@ interface AutoPanelProps {
   isEngineRunning?: boolean;
   apiBase?: string;
   selectedSerial?: string;
+  onClearLogs: () => Promise<void>;
 }
 
 export const AutoPanel: React.FC<AutoPanelProps> = ({
@@ -29,6 +30,7 @@ export const AutoPanel: React.FC<AutoPanelProps> = ({
   selectedSerial,
   onToggleEngine,
   isEngineRunning,
+  onClearLogs,
 }) => {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
@@ -41,6 +43,7 @@ export const AutoPanel: React.FC<AutoPanelProps> = ({
         onTestClick={onTestClick}
         onToggleEngine={onToggleEngine}
         engineRunning={isEngineRunning}
+        onClearLogs={onClearLogs}
       />
     </div>
   );

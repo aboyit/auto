@@ -3,6 +3,7 @@
 import asyncio
 from pathlib import Path
 import cv2
+import numpy as np
 
 from app.core.config import TEMPLATES_DIR
 from app.core.logger import log_manager
@@ -216,17 +217,37 @@ def find_button_by_template(
             center_y = ry1 + loc_roi[1] + th // 2
             return True, center_x, center_y, max_conf
 
-    # 2. Nếu chưa thấy ở góc phải, quét toàn màn hình để đề phòng game thay đổi tỉ lệ
+    # 2. Preserve the existing full-screen fallback at the original scale.
     if img_h >= th and img_w >= tw:
         res_full = cv2.matchTemplate(image, template, cv2.TM_CCOEFF_NORMED)
         _, val_full, _, loc_full = cv2.minMaxLoc(res_full)
-        if float(val_full) > max_conf:
-            max_conf = float(val_full)
-        if val_full >= threshold:
-            center_x = loc_full[0] + tw // 2
-            center_y = loc_full[1] + th // 2
-            return True, center_x, center_y, float(val_full)
+        if np.isfinite(val_full):
+            max_conf = max(max_conf, float(val_full))
+            if val_full >= threshold:
+                return True, loc_full[0] + tw // 2, loc_full[1] + th // 2, float(val_full)
 
+    # Scale changes occur when templates and device screenshots use different resolutions.
+    # Keep the original threshold: a lower threshold would increase accidental taps.
+    if float(np.std(template)) < 2.0:
+        return False, 0, 0, max_conf
+    best_point = (0, 0)
+    best_scale = 1.0
+    for scale in (0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95,
+                  1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.35, 1.4, 1.45, 1.5,
+                  1.55, 1.6, 1.65, 1.7, 1.75, 1.8, 1.85, 1.9, 1.95, 2.0):
+        width, height = round(tw * scale), round(th * scale)
+        if width < 8 or height < 8 or width > img_w or height > img_h:
+            continue
+        resized = cv2.resize(template, (width, height), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
+        result = cv2.matchTemplate(image, resized, cv2.TM_CCOEFF_NORMED)
+        _, confidence, _, location = cv2.minMaxLoc(result)
+        if np.isfinite(confidence) and confidence > max_conf:
+            max_conf = float(confidence)
+            best_point = (location[0] + width // 2, location[1] + height // 2)
+            best_scale = scale
+    if max_conf >= threshold and best_point != (0, 0):
+        log_manager.log("INFO", f"[VISION] '{filename}' scale={best_scale:.2f} confidence={max_conf:.3f} at {best_point}", "VISION")
+        return True, best_point[0], best_point[1], max_conf
     return False, 0, 0, max_conf
 
 async def execute_back_navigation(serial: str, custom_cfg=None) -> bool:

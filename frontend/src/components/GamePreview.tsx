@@ -9,6 +9,7 @@ interface GamePreviewProps {
     label: string;
     onPick: (p: Point) => void;
     onPickBox?: (box: BoxRegion) => void;
+    onPickSwipe?: (start: Point, end: Point) => void;
   } | null;
   onCancelPick?: () => void;
   navigatingStatus?: string | null;
@@ -199,7 +200,14 @@ export const GamePreview: React.FC<GamePreviewProps> = ({
         const endCoords = getDeviceCoords(e) || { x: cropBoxStart.devX, y: cropBoxStart.devY };
         const dist = Math.hypot(endCoords.x - cropBoxStart.devX, endCoords.y - cropBoxStart.devY);
 
-        if (dist >= 10 && pickingTarget.onPickBox) {
+        if (pickingTarget.onPickSwipe) {
+          if (dist >= 10) {
+            pickingTarget.onPickSwipe({ x: cropBoxStart.devX, y: cropBoxStart.devY }, endCoords);
+            setCopiedText('Đã chọn hướng vuốt.');
+          } else {
+            setCopiedText('Hãy kéo từ điểm bắt đầu đến điểm kết thúc.');
+          }
+        } else if (dist >= 10 && pickingTarget.onPickBox) {
           const x1 = Math.min(cropBoxStart.devX, endCoords.x);
           const y1 = Math.min(cropBoxStart.devY, endCoords.y);
           const x2 = Math.max(cropBoxStart.devX, endCoords.x);
@@ -288,8 +296,8 @@ export const GamePreview: React.FC<GamePreviewProps> = ({
               <span style={{ whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{navigatingStatus}</span>
             </div>
           ) : pickingTarget ? (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#fde68a', fontWeight: 700 }}>
-              <span>🎯 Gắn: <u>{pickingTarget.label}</u></span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#fde68a', fontWeight: 700, minWidth: 0 }}>
+              <span title={pickingTarget.label} style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>🎯 <u>{pickingTarget.label}</u></span>
             </div>
           ) : (
             <span style={{ color: isConnected && fps > 0 ? '#4ade80' : '#f59e0b' }}>

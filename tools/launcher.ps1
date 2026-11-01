@@ -1,7 +1,8 @@
 ﻿param(
     [string]$ProjectDir = (Split-Path -Parent $PSScriptRoot),
     [switch]$NoNotification,
-    [switch]$NoBrowser
+    [switch]$NoBrowser,
+    [switch]$SkipGameLaunch
 )
 $ErrorActionPreference = 'Stop'
 $ProjectDir = [IO.Path]::GetFullPath($ProjectDir)
@@ -99,6 +100,7 @@ function Open-Studio {
     }
 }
 function Start-Game {
+    if ($SkipGameLaunch) { return 'Game 3Q: skipped (no game input requested).' }
     Set-LauncherProgress 'Dang mo BlueStacks va Game 3Q (toi da 120 giay)...'
     try {
         $request = Start-Job -ScriptBlock { Invoke-RestMethod 'http://127.0.0.1:8000/api/devices/launch-game' -Method Post -TimeoutSec 120 }
@@ -125,6 +127,31 @@ function Test-Port([int]$Port) {
     $client = New-Object Net.Sockets.TcpClient
     try { $task = $client.ConnectAsync('127.0.0.1', $Port); if (-not $task.Wait(800)) { return $false }; return $client.Connected } catch { return $false } finally { $client.Dispose() }
 }
+function Stop-StudioServices {
+    $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -in @(8000, 5173) })
+    $services = @()
+    foreach ($listener in $listeners) {
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($listener.OwningProcess)" -ErrorAction Stop
+        $command = [string]$process.CommandLine
+        $main = Join-Path $ProjectDir 'main.py'
+        $vite = Join-Path $ProjectDir 'frontend\node_modules\vite\bin\vite.js'
+        $isBackend = $listener.LocalPort -eq 8000 -and $process.Name -match '^pythonw?\.exe$' -and $command.IndexOf($main, [StringComparison]::OrdinalIgnoreCase) -ge 0
+        $isFrontend = $listener.LocalPort -eq 5173 -and $process.Name -ieq 'node.exe' -and $command.IndexOf($vite, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and $command -match '\bpreview\b'
+        if (-not ($isBackend -or $isFrontend)) {
+            throw "Port $($listener.LocalPort) is occupied by an unrecognized process (PID $($listener.OwningProcess)). No process was stopped."
+        }
+        $services += $listener.OwningProcess
+    }
+    foreach ($processId in ($services | Select-Object -Unique)) {
+        Stop-Process -Id $processId -ErrorAction Stop
+        Add-Content -LiteralPath (Join-Path $logs 'launcher.log') -Value "$(Get-Date -Format s) Stopped studio service PID=$processId"
+    }
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Test-Port 8000) -or (Test-Port 5173)) {
+        if ((Get-Date) -ge $deadline) { throw 'Studio ports did not become available after stopping services.' }
+        Start-Sleep -Milliseconds 200
+    }
+}
 function Start-HiddenService([string]$Executable, [string]$Arguments, [string]$Name, [string]$WorkingDirectory) {
     # Redirect to files without a console host or a persistent PowerShell window.
     $process = Start-Process -FilePath $Executable -ArgumentList $Arguments -WorkingDirectory $WorkingDirectory -WindowStyle Hidden -RedirectStandardOutput (Join-Path $logs "$Name.stdout.log") -RedirectStandardError (Join-Path $logs "$Name.stderr.log") -PassThru
@@ -136,14 +163,8 @@ try {
     if (-not $lockAcquired) { throw 'Another launcher is already running. Please wait and try again.' }
     Start-LauncherProgress
     Set-LauncherProgress 'Dang kiem tra backend va frontend...'
-    if (Test-AppReady) {
-        Set-LauncherProgress 'Dang mo Studio va Game 3Q...'
-        Open-Studio
-        $gameStatus = Start-Game
-        Show-LauncherStatus "$gameStatus`r`nDich vu dang chay san.`r`nBackend: OK (8000)`r`nFrontend: OK (5173)`r`n`r`nMo: http://127.0.0.1:5173`r`nLog: $logs"
-        exit 0
-    }
-    if ((Test-Port 8000) -or (Test-Port 5173)) { throw 'Port 8000 or 5173 is occupied, but app health check failed. No process was stopped.' }
+    Set-LauncherProgress 'Dang dung cac dich vu Studio cu...'
+    Stop-StudioServices
     $python = Join-Path $ProjectDir '.venv\Scripts\python.exe'
     $frontend = Join-Path $ProjectDir 'frontend'
     $vite = Join-Path $frontend 'node_modules\vite\bin\vite.js'

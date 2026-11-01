@@ -1,4 +1,4 @@
-import React, { useRef, useEffect } from 'react';
+import React, { useRef, useEffect, useState } from 'react';
 import type { LogEntry } from '../types';
 
 interface ConsoleLogProps {
@@ -15,6 +15,15 @@ export const ConsoleLog: React.FC<ConsoleLogProps> = ({
   onToggleCollapse,
 }) => {
   const bottomRef = useRef<HTMLDivElement>(null);
+  const [copyStatus, setCopyStatus] = useState('');
+  const copyLogs = async () => {
+    try {
+      await navigator.clipboard.writeText(logs.map((log) => `[${log.time}] [${log.level}] <${log.tag}> ${log.message}`).join('\n'));
+      setCopyStatus('Đã copy');
+    } catch {
+      setCopyStatus('Copy thất bại');
+    }
+  };
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -44,6 +53,11 @@ export const ConsoleLog: React.FC<ConsoleLogProps> = ({
           <span style={{ fontSize: 11, background: '#1e293b', color: '#94a3b8', padding: '1px 6px', borderRadius: 10 }}>{logs.length}</span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          {!isCollapsed && (
+            <button type="button" onClick={copyLogs} disabled={!logs.length} title="Sao chép toàn bộ log" style={{ padding: '3px 8px', fontSize: 11, background: '#334155', color: '#cbd5e1', border: 'none', borderRadius: 4, cursor: logs.length ? 'pointer' : 'not-allowed' }}>
+              {copyStatus || 'Copy log'}
+            </button>
+          )}
           {!isCollapsed && (
             <button
               onClick={onClear}

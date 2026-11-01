@@ -5,12 +5,20 @@ import logging
 import uuid
 from pathlib import Path
 from typing import Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.core.config import DATA_DIR
 from app.core.auto_config import Point
 
 SCENARIOS_FILE = DATA_DIR / "scenarios.json"
+
+SwipeDirection = Literal["up", "down", "left", "right"]
+
+
+class DirectionalSwipe(BaseModel):
+    direction: SwipeDirection
+    count: int = Field(ge=0, le=100)
+
 
 ActionType = Literal[
     "tap",            # Nhan toa do (x, y)
@@ -57,7 +65,19 @@ class ScenarioStep(BaseModel):
     # Tham so cho 'swipe':
     swipe_from: Point = Field(default_factory=lambda: Point(x=360, y=400))
     swipe_to: Point = Field(default_factory=lambda: Point(x=360, y=900))
-    duration_ms: int = 400
+    duration_ms: int = Field(default=400, ge=50, le=5000)
+    # When set, execute these directions in order instead of the legacy coordinate swipe.
+    swipe_directions: list[DirectionalSwipe] = Field(default_factory=list, max_length=4)
+    swipe_distance_ratio: float = Field(default=0.12, gt=0, le=0.25)
+
+    @model_validator(mode="after")
+    def validate_swipe_directions(self) -> "ScenarioStep":
+        directions = [item.direction for item in self.swipe_directions]
+        if len(directions) != len(set(directions)):
+            raise ValueError("Each swipe direction may appear only once")
+        if sum(item.count for item in self.swipe_directions) > 100:
+            raise ValueError("Total directional swipes must not exceed 100")
+        return self
 
     # Tham so cho 'delay':
     delay_seconds: float = 2.0
@@ -87,7 +107,7 @@ class Scenario(BaseModel):
     name: str = "Kịch bản mới"
     description: str = ""
     enabled: bool = True
-    interval_minutes: int = 0  # 0 = chi chay thu cong khi bam nut, > 0 = tu chay dinh ky moi X phut
+    interval_minutes: int = 0  # 0 = once per engine session, > 0 = periodic interval in minutes
     last_run_time: float = 0.0
 
     # Lap lai toan bo quy trinh cac buoc trong kich ban (A -> B -> A -> B):
@@ -95,6 +115,7 @@ class Scenario(BaseModel):
     loop_delay: float = 0.5    # Nghi giua cac vong lap (giay)
 
     steps: list[ScenarioStep] = Field(default_factory=list)
+    start_step_id: str = ""
     connections: list[ScenarioConnection] = Field(default_factory=list)
 
 

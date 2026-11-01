@@ -37,14 +37,27 @@
    ```
 3. Mở trình duyệt tại `http://127.0.0.1:5173`.
 
+## Lịch chạy kịch bản
+- Kịch bản BẬT với thời gian 0 phút được thử chạy một lần trong mỗi lần bật auto; tắt rồi bật auto tạo phiên mới. Kịch bản TẮT không tự chạy. Nếu bật kịch bản giữa phiên, nó sẽ được chạy một lần trong phiên đó.
+- Thời gian lớn hơn 0 chạy theo chu kỳ. Số vòng lặp bên trong kịch bản vẫn được áp dụng; đặt 1 nếu muốn toàn bộ quy trình chỉ thực hiện một vòng. Một lần chạy thất bại không tự thử lại trong cùng phiên auto.
+
+### Swipe kịch bản (backend)
+`POST /api/scenarios/step/test` nhận `{"serial":"<ADB_SERIAL>","step":{"type":"swipe","swipe_directions":[{"direction":"up","count":2},{"direction":"right","count":1}],"swipe_distance_ratio":0.12,"duration_ms":400}}`. API lưu kịch bản `POST /api/scenarios` dùng cùng schema cho từng step. Các hướng thực hiện theo thứ tự mảng, mỗi lần kéo cùng độ dài pixel bằng tỉ lệ (0, 0.25] của cạnh ngắn ảnh gốc ADB; tối đa 4 hướng khác nhau, mỗi count 1–100, tổng tối đa 100, thời gian 50–5000 ms. Chụp màn hình thật một lần trước chuỗi; không kéo tiếp sau stop hoặc ADB báo lỗi. Nếu `swipe_directions` bỏ trống, vẫn dùng `swipe_from`/`swipe_to` như trước. Không xác nhận chuyển động bản đồ chỉ từ ADB success; thử trực tiếp trên BlueStacks khi có thiết bị.
+
 ## Quy chế code
 1. Những hàm dùng chung khai báo chung 1 file để dùng lại ở các file khác
 2. Mỗi task auto là 1 file riêng để dể quản lý và update sau này.
+## Chay thu tu card bat dau den card dich
+- Bam co 🚩 tren card dich: giao dien luu thay doi ngam (khong hien toast "Da luu"), mo tien trinh ngay, sau do goi `POST /api/scenarios/{scenario_id}/run-until` voi `{"serial":"<ADB_SERIAL>","stop_step_id":"<STEP_ID>"}`. Neu backend tu choi (vi du auto dang chay), tien trinh hien HTTP/status loi thay vi im lang. Chi thuc hien cac card tren nhanh duoc chon theo ket qua thuc te; neu nhanh khong den card dich thi khong tu chay nhanh khac.
+
 ## Sap xep so do macro
-- Bam Tu Dong Xep Luoi: thu 1-4 cot (toi da 4 card moi hang), chon so cot hien thi can doi nhat trong viewport, tu thu zoom va can giua de xem toan bo graph khong can cuon ngang/doc. So do lon se co card nho; dung +/- de doc chi tiet. Chuoi thuong uu tien nam ngang; nhanh Co/Khong xuong hang duoi va hai card con cung hang khi khong mau thuan quan he truoc/sau.
-- Card tao vong lap uu tien ben phai. Nhan Co/Khong doi ben theo vi tri dich; duong noi vuong goc tranh card va phan lan cho duong quay nguoc, giam trung doan day.
-- Keo card thu cong se tinh lai duong noi. Neu card de len nhau hoac bit cong noi, bam sap xep lai; graph phuc tap co the van co giao diem day, khong cam ket graph bat ky deu ve phang.
-- Sap xep khong doi thu tu thuc thi hay nhanh ket noi, khong tu luu; bam LUU KICH BAN de giu bo cuc sau reload.
+- Chon kieu xep roi bam Sap Xep: Gon ngang dung 1-4 cot tuy chieu rong viewport, chuoi thuong uu tien sang phai, nhanh Co/Khong xuong hang; Theo doi doc dua chuoi thuong xuong duoi; voi hai nhanh rieng biet va chua duoc xep, card CÓ nam ben trai, card cha If/Else o giua, card KHÔNG ben phai tren cung mot hang. Card duoc nhieu nhanh dung chung khong the nam canh moi card cha; khi do layout giu card rieng va duong noi. Day quay lai trong vong lap co the tro ve card phia tren. Tu thu zoom de vua graph; dung +/- de doc chi tiet, luu kich ban khi muon giu vi tri moi.
+- Nhan tren card: VÀO mau vang la input (dich cua day noi); RA mau xanh la output (keo day tu day); nhanh RA: CÓ mau xanh la, RA: KHÔNG mau do la hai output theo ket qua. Mui ten tren day chi ve phia card nhan.
+- Card tao vong lap uu tien ben phai. Nhan Co/Khong doi ben theo vi tri dich. Moi day co cong vao rieng, ke ca nhieu nhanh vao Finish; cong va doan dau/cuoi duoc giu cho truoc khi tim duong. Cam trung doan thang co do dai duong (ke ca stub), khong chi cong them chi phi. Start duoc ghim hang tren; Finish nam cac hang duoi.
+- Keo card thu cong se tinh lai duong noi, khong doi graph thuc thi. Giao diem ngang/doc dung cau vuot nho (khong phai nut noi); graph bat ky khong duoc dam bao phang. Card de len nhau/bit cong se co canh bao, khong am tham mat day; moi ket noi van co nut xoa. Ket noi tham chieu ID da xoa duoc thong bao rieng, khong tu xoa du lieu cu.
+- Test hoi quy (Node.js >=22.18): `cd frontend; npm test; npm run build; npm run lint`. Kiem tra thu cong khong bam game: mo kich ban, Tu Dong Xep Luoi, xem moi nhanh vao Finish co mui ten/cong rieng; kiem tra nhanh quay lai, keo card, xoa/noi lai mot day tren ban sao. Bam LUU KICH BAN chi khi muon luu thay doi.
+- Routing chi thay doi hien thi, khong doi API/payload connections (`from_id`, `to_id`, `branch`) hay backend execution.
+- Ca hai kieu xep deu dat card bat dau o hang tren cung (neu kich ban da chon diem bat dau), ke ca khi card do co day noi di vao. Sap xep khong doi thu tu thuc thi hay nhanh ket noi, khong tu luu; bam LUU KICH BAN de giu bo cuc sau reload.
 
 ## Chon toa do macro tren anh
 - Trong action Bam toa do, bam `Chon tren anh chup (khong bam game)`, chon diem tren anh, sau do `Luu toa do`. Anh chup dung kich thuoc device goc; diem duoc quy doi tu kich thuoc hien thi sang pixel device.
@@ -59,7 +72,7 @@
 - Tuy chon moi truong backend: `BLUESTACKS_INSTANCE`, `BLUESTACKS_PLAYER`, `BLUESTACKS_CONFIG`. Neu nhieu thiet bi dang online, chon thiet bi tren giao dien truoc khi mo game.
 - API: `POST /api/devices/launch-game` tu khoi dong; `POST /api/devices/{serial}/launch-game` dung thiet bi da chon. Loi tra HTTP 503 voi code `GAME_LAUNCH_FAILED`; thanh cong tra serial va xac nhan activity game foreground, khong bao dam da dang nhap vao game.
 - Chay lai `run.bat` de kiem tra dich vu va mo game. Khong tu tat tien trinh hay khoi dong trung. Dung `powershell.exe -NoProfile -File tools\launcher.ps1 -NoNotification` neu chi can ket qua trong terminal, khong hien hop thoai.
-- Launcher tu build giao dien khi khoi dong moi. Khong su dung watcher/auto-reload. De kiem tra khong mo hop thoai/trinh duyet: `powershell.exe -NoProfile -File tools\launcher.ps1 -NoNotification -NoBrowser`.
+- Launcher tu build giao dien khi khoi dong moi. Khong su dung watcher/auto-reload. De kiem tra khong mo hop thoai/trinh duyet/game: `powershell.exe -NoProfile -File tools\launcher.ps1 -NoNotification -NoBrowser -SkipGameLaunch`. Co `-SkipGameLaunch` thi khong goi API launch-game; mac dinh run.bat van mo game nhu cu. Khi cap nhat app dang chay, kiem tra PID dang LISTEN cong 8000/5173 va CommandLine dung project, chi dung hai PID da xac nhan truoc khi chay launcher; launcher khong tu tat process.
 - Mo `http://127.0.0.1:5173` thu cong. Log dich vu nam trong `data/logs/backend.stderr.log`, `frontend.stderr.log` va cac file stdout tuong ung.
 - Neu cong 8000/5173 da ban, launcher bao loi va khong tat tien trinh khac; khong tu mo BlueStacks hay game.
 - Neu `backend.stderr.log` bao `did not find executable at ...python.exe`, venv dang tro toi ban Python da bi go. Cai Python >=3.11, sau do tai thu muc goc chay `& 'C:\duong-dan-den-python\python.exe' -m venv --upgrade .venv` va `& '.\.venv\Scripts\python.exe' -m pip install -r requirements.txt`. Neu import van loi sau khi nang cap venv, cai lai dependency bang `& '.\.venv\Scripts\python.exe' -m pip install --force-reinstall -r requirements.txt`; chay lai `run.bat`. Launcher kiem tra Python va dependencies truoc khi mo service de bao loi som.

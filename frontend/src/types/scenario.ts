@@ -46,6 +46,8 @@ export interface ScenarioStep {
   swipe_from?: Point;
   swipe_to?: Point;
   duration_ms?: number;
+  swipe_directions?: { direction: 'up' | 'down' | 'left' | 'right'; count: number }[];
+  swipe_distance_ratio?: number;
 
   // Params delay:
   delay_seconds?: number;
@@ -83,6 +85,7 @@ export interface Scenario {
   loop_delay?: number; // Thời gian nghỉ giữa các vòng lặp (giây)
 
   steps: ScenarioStep[];
+  start_step_id?: string;
   connections?: ScenarioConnection[];
 }
 

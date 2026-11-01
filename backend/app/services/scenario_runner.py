@@ -2,9 +2,13 @@
 
 import asyncio
 import time
+from datetime import datetime, timezone
+from typing import Any
+from uuid import uuid4
 from app.core.logger import log_manager
 from app.core.scenario_models import Scenario, ScenarioStep, load_scenarios, save_scenarios
 from app.services.dispatcher import input_dispatcher
+from app.services.scenario_swipe import execute_swipe
 from app.services.auto_common import safe_tap, find_button_by_template, execute_camera_reset, execute_back_navigation
 
 class ScenarioTracker:
@@ -236,6 +240,9 @@ async def execute_scenario_step(
     overall_success = True
 
     for rep in range(1, repeat_times + 1):
+        if scenario_tracker.should_stop():
+            return False
+        rep_start_time = time.time()
         scenario_tracker.set_step(step.id, step.name, cycle, rep, repeat_times, "running", scenario_id=scenario_id)
         if repeat_times > 1:
             log_manager.log("INFO", f"  ↪ [Lần {rep}/{repeat_times}] Đang thực hiện '{step.name}'...", tag)
@@ -303,6 +310,8 @@ async def execute_scenario_step(
                             context["matched_steps"][step.id] = (cx, cy)
                             context["last_step_detail"]        = f"Thấy ảnh '{tpl}' ({conf:.2f} >= {step.threshold}) và nhấn ({cx}, {cy})"
                         step_success = await safe_tap(serial, cx, cy, delay_after=step.delay_after, label=f"{step.name} ({tpl})")
+                        if not step_success and context is not None:
+                            context["last_step_detail"] = f"Thấy ảnh '{tpl}' tại ({cx}, {cy}) nhưng nhấn thất bại"
                         found_match  = True
                         break
 
@@ -373,18 +382,16 @@ async def execute_scenario_step(
 
         # 4. Vuốt màn hình (Swipe)
         elif step_type == "swipe":
-            sf  = step.swipe_from
-            st  = step.swipe_to
-            dur = getattr(step, 'duration_ms', 400)
-            step_success = await input_dispatcher.swipe(serial, sf.x, sf.y, st.x, st.y, duration_ms=dur)
-            if step_success:
-                log_manager.log("INFO", f"✔ [VUỐT] Vuốt màn hình '{step.name}' thành công", tag)
-                if context is not None:
-                    context["last_step_detail"] = f"Vuốt từ ({sf.x}, {sf.y}) đến ({st.x}, {st.y}) ({dur}ms)"
+            step_success = await execute_swipe(serial, step, scenario_tracker.should_stop)
+            if step.swipe_directions:
+                detail = ", ".join(f"{item.direction} x{item.count}" for item in step.swipe_directions)
+                detail = f"Vuốt theo thứ tự {detail} ({step.duration_ms}ms mỗi lần)"
             else:
-                log_manager.log("ERROR", f"❌ [VUỐT] Vuốt màn hình '{step.name}' thất bại", tag)
-                if context is not None:
-                    context["last_step_detail"] = f"Vuốt từ ({sf.x}, {sf.y}) đến ({st.x}, {st.y}) thất bại"
+                sf, st = step.swipe_from, step.swipe_to
+                detail = f"Vuốt từ ({sf.x}, {sf.y}) đến ({st.x}, {st.y}) ({step.duration_ms}ms)"
+            log_manager.log("INFO" if step_success else "ERROR", f"[VUỐT] {detail}: {'thành công' if step_success else 'thất bại hoặc đã dừng'}", tag)
+            if context is not None:
+                context["last_step_detail"] = detail + (" thành công" if step_success else " thất bại hoặc đã dừng")
 
         # 5. Chờ đợi (Delay)
         elif step_type == "delay":
@@ -448,9 +455,19 @@ async def execute_scenario_step(
         else:
             step_status = "failed"
         scenario_tracker.set_step(step.id, step.name, cycle, rep, repeat_times, step_status, scenario_id=scenario_id)
+        if step_type == "template_tap" and repeat_times > 1 and scenario_id and context is not None:
+            scenario_tracker.record_step_execution({
+                "step_id": step.id, "step_name": step.name, "step_type": step_type,
+                "cycle": cycle, "success": step_success, "rep": rep, "total_reps": repeat_times,
+                "branch_taken": "default", "branch_name": "Lần lặp",
+                "duration_sec": round(time.time() - rep_start_time, 2),
+                "detail": context.get("last_step_detail", ""), "time": time.strftime("%H:%M:%S"),
+            })
         if not step_success:
             overall_success = False
 
+        if scenario_tracker.should_stop():
+            return False
         if rep < repeat_times:
             await asyncio.sleep(repeat_delay)
 
@@ -537,7 +554,12 @@ async def execute_scenario_graph(
             in_degrees[to_id] = in_degrees[to_id] + 1
 
     start_candidates = [s for s in scenario.steps if s.enabled and in_degrees.get(s.id, 0) == 0]
-    if start_candidates:
+    if scenario.start_step_id:
+        current_step = step_dict.get(scenario.start_step_id)
+        if current_step is None or not current_step.enabled:
+            log_manager.log("ERROR", "Card bắt đầu không tồn tại hoặc đang tắt", tag)
+            return False, False
+    elif start_candidates:
         current_step = start_candidates[0]
     else:
         current_step = scenario.steps[0]
@@ -767,6 +789,13 @@ async def execute_scenario(serial: str, scenario_id: str, depth: int = 0, stop_s
             else:
                 # Nếu không có mũi tên nào, chạy danh sách phẳng
                 executable_steps = [s for s in scenario.steps if s.enabled]
+                if scenario.start_step_id:
+                    start_index = next((i for i, step in enumerate(executable_steps) if step.id == scenario.start_step_id), None)
+                    if start_index is None:
+                        log_manager.log("ERROR", "Card bắt đầu không tồn tại hoặc đang tắt", tag)
+                        success_all = False
+                        break
+                    executable_steps = executable_steps[start_index:]
                 context          = {"last_match_point": None, "matched_steps": {}}
                 for idx, step in enumerate(executable_steps, 1):
                     if scenario_tracker.should_stop():
@@ -841,55 +870,214 @@ async def execute_scenario(serial: str, scenario_id: str, depth: int = 0, stop_s
             scenario_tracker.finalize_report(scenario.id, scenario.name, success_all, stop_reason)
         scenario_tracker.pop_scenario(scenario.id)
 
-    final_result = success_all
+    final_result = success_all and not scenario_tracker.should_stop()
     return final_result
 
 
+def _iso_time(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+
+
 class ScenarioEngine:
-    """Quản lý chạy nền các kịch bản định kỳ."""
+    """Owns the session's schedule and every attempt made by the background runner."""
 
     def __init__(self):
         self.is_running = False
         self.active_serial = ""
         self.task: asyncio.Task | None = None
+        self.session_id: str | None = None
+        self.started_at: float | None = None
+        self.ended_at: float | None = None
+        self.reports: list[dict[str, Any]] = []
+        self.ran_once: set[str] = set()
+        self.last_run_at: dict[str, float] = {}
+        self.active_report: dict[str, Any] | None = None
 
     def start(self, serial: str):
-        if self.is_running:
+        if self.task and not self.task.done():
+            if not self.is_running:
+                raise RuntimeError("Engine is still stopping")
             return
+        if scenario_tracker.state["is_running"]:
+            raise RuntimeError("A scenario is already running")
         self.active_serial = serial
+        self.session_id = uuid4().hex
+        self.started_at = time.time()
+        self.ended_at = None
+        self.reports = []
+        self.ran_once = set()
+        self.last_run_at = {}
+        self.active_report = None
         self.is_running = True
         self.task = asyncio.create_task(self._run_loop())
         log_manager.log("INFO", f"▶ Scenario Engine ĐÃ BẬT cho thiết bị {serial}", "ENGINE")
 
     def stop(self):
         self.is_running = False
+        self.ended_at = time.time() if self.started_at is not None else None
         if self.task and not self.task.done():
             self.task.cancel()
-            self.task = None
         log_manager.log("INFO", "🛑 Scenario Engine ĐÃ DỪNG", "ENGINE")
 
+    def get_progress(self) -> dict[str, Any]:
+        """Produce a fresh snapshot; never expose mutable tracker or report internals."""
+        now = time.time()
+        scenarios = load_scenarios()
+        by_id: dict[str, list[dict[str, Any]]] = {}
+        for report in self.reports:
+            by_id.setdefault(report["scenario_id"], []).append(report)
+        known = {sc.id for sc in scenarios}
+        for scenario_id, reports in by_id.items():
+            if scenario_id not in known:
+                scenarios.append(Scenario(id=scenario_id, name=reports[-1]["scenario_name"], enabled=False))
+        if self.active_report and self.active_report["scenario_id"] not in {sc.id for sc in scenarios}:
+            scenarios.append(Scenario(
+                id=self.active_report["scenario_id"],
+                name=self.active_report["scenario_name"], enabled=False,
+            ))
+
+        scenario_progress = []
+        for sc in scenarios:
+            attempts = [dict(report) for report in by_id.get(sc.id, [])]
+            for report in attempts:
+                report["steps"] = [dict(step) for step in report["steps"]]
+            active = self.active_report if self.active_report and self.active_report["scenario_id"] == sc.id else None
+            if active:
+                live = dict(active)
+                live["steps"] = [dict(step) for step in scenario_tracker.current_run_steps]
+                live["total_steps"] = len(live["steps"])
+                live["success_count"] = sum(bool(step.get("success")) for step in live["steps"])
+                live["failed_count"] = live["total_steps"] - live["success_count"]
+                attempts.append(live)
+            next_run = None
+            if self.is_running and sc.enabled and not active:
+                if sc.interval_minutes == 0:
+                    if sc.id not in self.ran_once:
+                        next_run = now
+                else:
+                    last_run = self.last_run_at.get(sc.id, sc.last_run_time)
+                    next_run = max(now, last_run + sc.interval_minutes * 60)
+            scenario_progress.append({
+                "scenario_id": sc.id,
+                "scenario_name": sc.name,
+                "enabled": sc.enabled,
+                "interval_minutes": sc.interval_minutes,
+                "next_run_at": _iso_time(next_run) if next_run is not None else None,
+                "run_count": len(attempts),
+                "success_count": sum(r["final_status"] == "success" for r in attempts),
+                "failure_count": sum(r["final_status"] == "failed" for r in attempts),
+                "reports": attempts,
+            })
+
+        active_step = None
+        if self.active_report:
+            state = scenario_tracker.state
+            active_step = {
+                "scenario_id": state["scenario_id"],
+                "step_id": state["current_step_id"],
+                "step_name": state["current_step_name"],
+                "cycle": state["current_cycle"],
+                "total_cycles": state["total_cycles"],
+                "rep": state["current_rep"],
+                "total_reps": state["total_reps"],
+                "call_stack": [dict(frame) for frame in state["call_stack"]],
+            }
+        return {
+            "session_id": self.session_id,
+            "is_running": self.is_running,
+            "serial": self.active_serial if self.session_id else None,
+            "started_at": _iso_time(self.started_at) if self.started_at is not None else None,
+            "ended_at": _iso_time(self.ended_at) if self.ended_at is not None else None,
+            "total_runs": len(self.reports) + int(self.active_report is not None),
+            "success_count": sum(r["final_status"] == "success" for r in self.reports),
+            "failure_count": sum(r["final_status"] == "failed" for r in self.reports),
+            "active_step": active_step,
+            "scenarios": scenario_progress,
+        }
+
+    async def _run_scenario(self, sc: Scenario) -> None:
+        started = time.time()
+        report: dict[str, Any] = {
+            "run_id": uuid4().hex,
+            "scenario_id": sc.id,
+            "scenario_name": getattr(sc, "name", sc.id),
+            "started_at": _iso_time(started),
+            "ended_at": None,
+            "final_status": "running",
+            "stop_reason": "",
+            "total_duration_sec": 0.0,
+            "total_steps": 0,
+            "success_count": 0,
+            "failed_count": 0,
+            "steps": [],
+        }
+        self.active_report = report
+        scenario_tracker.current_run_steps = []
+        scenario_tracker.last_report = None
+        try:
+            success = await execute_scenario(self.active_serial, sc.id)
+            finished = scenario_tracker.get_last_report()
+            report["final_status"] = "stopped" if scenario_tracker.should_stop() else ("success" if success else "failed")
+            if finished and finished.get("scenario_id") == sc.id:
+                report.update({key: finished[key] for key in (
+                    "stop_reason", "total_steps", "success_count", "failed_count", "steps"
+                )})
+            else:
+                report["stop_reason"] = "Scenario returned without a report"
+        except asyncio.CancelledError:
+            report["final_status"] = "stopped"
+            report["stop_reason"] = "Engine stopped"
+            raise
+        except Exception as exc:
+            report["final_status"] = "failed"
+            report["stop_reason"] = str(exc)
+            log_manager.log("ERROR", f"Lỗi chạy kịch bản '{sc.id}': {exc}", "ENGINE")
+        finally:
+            if report["final_status"] in ("stopped", "failed") and not report["steps"]:
+                report["steps"] = [dict(step) for step in scenario_tracker.current_run_steps]
+                report["total_steps"] = len(report["steps"])
+                report["success_count"] = sum(bool(step.get("success")) for step in report["steps"])
+                report["failed_count"] = report["total_steps"] - report["success_count"]
+            ended = time.time()
+            self.last_run_at[sc.id] = ended
+            report["ended_at"] = _iso_time(ended)
+            report["total_duration_sec"] = round(ended - started, 2)
+            report["steps"] = [dict(step) for step in report["steps"]]
+            self.reports.append(report)
+            self.active_report = None
+
     async def _run_loop(self):
-        while self.is_running:
-            try:
-                scenarios = load_scenarios()
-                now = time.time()
-                for sc in scenarios:
-                    if not self.is_running:
-                        break
-                    # Chi chay cac kich ban duoc bat va co interval > 0
-                    if sc.enabled and sc.interval_minutes > 0:
-                        interval_sec = sc.interval_minutes * 60
-                        if now - sc.last_run_time >= interval_sec:
-                            await execute_scenario(self.active_serial, sc.id)
-                            # Nghi nhe giua cac kich ban
+        try:
+            while self.is_running:
+                try:
+                    scenarios = load_scenarios()
+                    now = time.time()
+                    for sc in scenarios:
+                        if not self.is_running:
+                            break
+                        if not sc.enabled:
+                            continue
+                        run_once = sc.interval_minutes == 0 and sc.id not in self.ran_once
+                        last_run = self.last_run_at.get(sc.id, sc.last_run_time)
+                        due = sc.interval_minutes > 0 and now - last_run >= sc.interval_minutes * 60
+                        if run_once or due:
+                            if run_once:
+                                self.ran_once.add(sc.id)
+                            await self._run_scenario(sc)
                             await asyncio.sleep(2.0)
                             now = time.time()
-                await asyncio.sleep(1.0)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                log_manager.log("ERROR", f"Lỗi vòng lặp Scenario Engine: {e}", "ENGINE")
-                await asyncio.sleep(3.0)
+                    await asyncio.sleep(1.0)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log_manager.log("ERROR", f"Lỗi vòng lặp Scenario Engine: {exc}", "ENGINE")
+                    await asyncio.sleep(3.0)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.is_running = False
+            if self.started_at is not None and self.ended_at is None:
+                self.ended_at = time.time()
 
 scenario_engine = ScenarioEngine()
 

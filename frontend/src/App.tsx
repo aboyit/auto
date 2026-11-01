@@ -35,6 +35,7 @@ export function App() {
     label: string;
     onPick: (p: Point) => void;
     onPickBox?: (box: BoxRegion) => void;
+    onPickSwipe?: (start: Point, end: Point) => void;
   } | null>(null);
   const [navigatingLabel, setNavigatingLabel] = useState<string | null>(null);
   const [navigatingStatus, setNavigatingStatus] = useState<string | null>(null);
@@ -250,7 +251,8 @@ export function App() {
 
   const handleClearLogs = async () => {
     try {
-      await fetch(`${API_BASE}/api/auto/logs/clear`, { method: 'POST' });
+      const response = await fetch(`${API_BASE}/api/auto/logs/clear`, { method: 'POST' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
       setLogs([]);
     } catch (err) {
       console.error('Loi xoa log:', err);
@@ -260,7 +262,8 @@ export function App() {
   const handleStartPick = async (
     label: string,
     onPicked: (p: Point, box?: BoxRegion) => void,
-    previousSteps?: StepPoint[]
+    previousSteps?: StepPoint[],
+    mode?: 'swipe'
   ) => {
     setIsStreamEnabled(true);
     const targetSerial = selectedSerial || (devices.length > 0 ? devices[0].serial : '');
@@ -434,6 +437,10 @@ export function App() {
 
         setPickingTarget(null);
       },
+      onPickSwipe: mode === 'swipe' ? (start: Point, end: Point) => {
+        onPicked(start, { x1: start.x, y1: start.y, x2: end.x, y2: end.y });
+        setPickingTarget(null);
+      } : undefined,
       onPickBox: async (box: BoxRegion) => {
         const centerPoint: Point = {
           x: Math.round((box.x1 + box.x2) / 2),
@@ -687,6 +694,7 @@ export function App() {
               onResetCamera={handleResetCamera}
               apiBase={API_BASE}
               selectedSerial={selectedSerial}
+              onClearLogs={handleClearLogs}
             />
           </div>
 

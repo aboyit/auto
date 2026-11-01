@@ -1,20 +1,22 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import type { Point, StepPoint, BoxRegion } from '../../types';
 import type { Scenario, ScenarioStep, ActionType } from '../../types/scenario';
 import { ACTION_GROUPS, ActionDropdown } from './ActionDropdown';
 import { CoordinatePicker } from './CoordinatePicker';
 import { computeOptimalLayout } from './graphAutoLayout';
-import { routeConnections, connectionKey } from './graphRouting';
+import { routeConnections, connectionKey, swapBranchPorts } from './graphRouting';
 
 interface ScenarioManagerProps {
   apiBase: string;
   selectedSerial: string;
   activePickingLabel?: string | null;
-  onStartPick: (label: string, onPicked: (p: Point, box?: BoxRegion) => void, previousSteps?: StepPoint[]) => void;
+  onStartPick: (label: string, onPicked: (p: Point, box?: BoxRegion) => void, previousSteps?: StepPoint[], mode?: 'swipe') => void;
   onCancelPick: () => void;
   onTestClick?: (label: string, point: Point) => void;
   onToggleEngine?: () => void;
   engineRunning?: boolean;
+  onClearLogs: () => Promise<void>;
 }
 
 export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
@@ -26,17 +28,42 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
   onTestClick: _onTestClick,
   onToggleEngine: onToggleEngineProp,
   engineRunning,
+  onClearLogs,
 }) => {
+  const [previewImage, setPreviewImage] = useState<{ src: string; name: string } | null>(null);
+  useEffect(() => {
+    if (!previewImage) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setPreviewImage(null);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [previewImage]);
   const [coordinateStepId, setCoordinateStepId] = useState<string | null>(null);
   const [scenarios, setScenarios] = useState<Scenario[]>([]);
+  const scenariosRef = useRef<Scenario[]>([]);
+  scenariosRef.current = scenarios;
+  const flowHistory = useRef(new Map<string, { past: Pick<Scenario, 'steps' | 'connections' | 'start_step_id'>[]; future: Pick<Scenario, 'steps' | 'connections' | 'start_step_id'>[] }>());
+  const dragHistoryRecorded = useRef(false);
+  const [draggedScenarioId, setDraggedScenarioId] = useState<string | null>(null);
+  const [scenarioDropTarget, setScenarioDropTarget] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string>('');
   const [isRunningEngine, setIsRunningEngine] = useState<boolean>(false);
+  const [engineProgress, setEngineProgress] = useState<{ is_running: boolean; session_id: string | null; active_step: { scenario_id: string; step_id: string; step_name: string } | null; scenarios: { scenario_id: string; scenario_name: string; enabled: boolean; interval_minutes: number; next_run_at: string | null; success_count: number; failure_count: number; reports: { run_id: string; started_at: string; final_status: string; steps: { step_id: string; step_name?: string; success: boolean; detail?: string }[] }[] }[] } | null>(null);
+  const [detailScenarioId, setDetailScenarioId] = useState<string | null>(null);
   const isRunningEngineRef = useRef(false);
   const engineToggleRef = useRef<(desiredState?: boolean) => Promise<void>>(async () => {});
   const [runningScenarioId, setRunningScenarioId] = useState<string | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
   const [isProgressPopupOpen, setIsProgressPopupOpen] = useState<boolean>(false);
   const [isProgressMinimized, setIsProgressMinimized] = useState(false);
+  const [monitorPosition, setMonitorPosition] = useState<{ x: number; y: number } | null>(null);
+  const [monitorDragging, setMonitorDragging] = useState(false);
+  const monitorRef = useRef<HTMLDivElement>(null);
+  const monitorLogRef = useRef<HTMLDivElement>(null);
+  const monitorDragRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
+  const [highlightedStep, setHighlightedStep] = useState<{ scenarioId: string; stepId: string } | null>(null);
+  const [selectedFlowStep, setSelectedFlowStep] = useState<{ scenarioId: string; stepId: string } | null>(null);
   const [testingStepId, setTestingStepId] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [saveFeedback, setSaveFeedback] = useState<{
@@ -55,10 +82,14 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
   const dragMoveDistance = useRef<number>(0);
   const dragStartMouse = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const dragStartNodePos = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const dragGrabOffset = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const previousCanvasOrigin = useRef<{ scenarioId: string; left: number; top: number; zoom: number } | null>(null);
 
   // Thu phóng sơ đồ (Zoom In / Out)
   const [canvasZoom, setCanvasZoom] = useState<number>(1.0);
-  const [canvasContextMenu, setCanvasContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const [layoutDirection, setLayoutDirection] = useState<'horizontal' | 'vertical'>('horizontal');
+  const [canvasContextMenu, setCanvasContextMenu] = useState<{ x: number; y: number; stepId?: string } | null>(null);
+  const [copiedStep, setCopiedStep] = useState<{ step: ScenarioStep; scenarioId: string } | null>(null);
   const canvasContextMenuRef = useRef<{ x: number; y: number } | null>(null);
   const canvasContextMenuElementRef = useRef<HTMLDivElement>(null);
   const panStateRef = useRef<{ pointerX: number; pointerY: number; scrollLeft: number; scrollTop: number } | null>(null);
@@ -90,6 +121,38 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
       window.removeEventListener('mousemove', handlePanMove);
       window.removeEventListener('mouseup', handlePanEnd);
     };
+  }, []);
+
+  useEffect(() => {
+    const move = (event: PointerEvent) => {
+      const drag = monitorDragRef.current;
+      const monitor = monitorRef.current;
+      if (!drag || !monitor) return;
+      const width = monitor.offsetWidth;
+      const height = monitor.offsetHeight;
+      setMonitorPosition({
+        x: Math.max(0, Math.min(window.innerWidth - width, drag.left + event.clientX - drag.x)),
+        y: Math.max(0, Math.min(window.innerHeight - height, drag.top + event.clientY - drag.y)),
+      });
+    };
+    const end = () => { monitorDragRef.current = null; setMonitorDragging(false); };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', end);
+    window.addEventListener('pointercancel', end);
+    return () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', end);
+      window.removeEventListener('pointercancel', end);
+    };
+  }, []);
+
+  useEffect(() => {
+    const clamp = () => setMonitorPosition((position) => position && ({
+      x: Math.max(0, Math.min(position.x, window.innerWidth - (monitorRef.current?.offsetWidth ?? 0))),
+      y: Math.max(0, Math.min(position.y, window.innerHeight - (monitorRef.current?.offsetHeight ?? 0))),
+    }));
+    window.addEventListener('resize', clamp);
+    return () => window.removeEventListener('resize', clamp);
   }, []);
 
   // Trạng thái theo dõi tiến trình chạy thời gian thực (Realtime Progress Tracker)
@@ -168,12 +231,15 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
   // Check Engine status & Execution Progress
   const checkEngineStatus = async () => {
     try {
-      const res = await fetch(`${apiBase}/api/scenarios/engine/status`);
+      const res = await fetch(`${apiBase}/api/scenarios/engine/progress`);
       if (res.ok) {
         const data = await res.json();
-        isRunningEngineRef.current = data.is_running;
-        setIsRunningEngine(data.is_running);
-        window.dispatchEvent(new CustomEvent('studio-engine-state', { detail: data.is_running }));
+        setEngineProgress(data);
+        if (isRunningEngineRef.current !== data.is_running) {
+          isRunningEngineRef.current = data.is_running;
+          setIsRunningEngine(data.is_running);
+          window.dispatchEvent(new CustomEvent('studio-engine-state', { detail: data.is_running }));
+        }
       }
     } catch {
       // ignore
@@ -234,6 +300,54 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
   }, [apiBase]);
 
   const activeScenario = scenarios.find((s) => s.id === selectedId) || null;
+  const progressStepName = (scenarioId: string | undefined, stepId: string | undefined, fallback?: string) => {
+    const scenario = scenarios.find(item => item.id === scenarioId);
+    const step = scenario?.steps.find(item => item.id === stepId) ||
+      (stepId ? scenarios.flatMap(item => item.steps).find(item => item.id === stepId) : undefined);
+    return step?.name?.trim() || fallback?.trim() || 'Hành động';
+  };
+  const renderProgressDetail = (detail: string) => {
+    const match = detail.match(/^(Thấy ảnh ')([^']+)('.*)$/);
+    if (!match) return detail;
+    const [, before, name, after] = match;
+    const src = `${apiBase}/api/auto/template/image/${encodeURIComponent(name)}?t=${refreshImgKey}`;
+    return <>{before}<img src={src} alt={name} title={`Bấm để xem lớn: ${name}`} role="button" tabIndex={0}
+      onClick={(event) => { event.stopPropagation(); setPreviewImage({ src, name }); }}
+      onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); setPreviewImage({ src, name }); } }}
+      style={{ display: 'inline-block', verticalAlign: 'middle', width: 44, height: 44, objectFit: 'contain', background: '#040711', border: '1px solid #475569', borderRadius: 5, cursor: 'zoom-in', margin: '0 5px' }}
+    />{after}</>;
+  };
+  const autoMonitor = Boolean(isRunningEngine || engineProgress?.is_running);
+  const monitorVisible = !isProgressMinimized && Boolean(autoMonitor || isProgressPopupOpen || execState?.is_running || runningScenarioId || testingStepId || runError);
+
+  useEffect(() => {
+    const log = monitorLogRef.current;
+    if (log) log.scrollTop = log.scrollHeight;
+  }, [execState?.current_run_steps?.length, execState?.scenario_id, monitorVisible]);
+
+  useEffect(() => {
+    const viewport = canvasViewportRef.current;
+    if (!viewport || viewMode !== 'n8n' || !activeScenario) return;
+    const handleWheel = (event: WheelEvent) => {
+      if (event.target instanceof Element && event.target.closest('[data-canvas-menu]')) return;
+      event.preventDefault();
+      if (!event.deltaY) return;
+      const delta = event.deltaY < 0 ? 0.08 : -0.08;
+      setCanvasZoom((prev) => Math.min(2.0, Math.max(0.1, Math.round((prev + delta) * 100) / 100)));
+    };
+    viewport.addEventListener('wheel', handleWheel, { passive: false });
+    return () => viewport.removeEventListener('wheel', handleWheel);
+  }, [viewMode, Boolean(activeScenario)]);
+
+  useEffect(() => {
+    if (!highlightedStep || highlightedStep.scenarioId !== selectedId) return;
+    const frame = requestAnimationFrame(() => {
+      const card = Array.from(document.querySelectorAll<HTMLElement>('[data-progress-step-id]'))
+        .find((element) => element.dataset.progressStepId === highlightedStep.stepId);
+      card?.scrollIntoView({ block: 'center', inline: 'center', behavior: 'smooth' });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [highlightedStep, selectedId, viewMode]);
 
   // Toast góc phải dưới: tự động mờ dần và ẩn hoàn toàn sau 2 giây
   useEffect(() => {
@@ -262,9 +376,9 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
   }, [saveFeedback]);
 
   // Lưu toàn bộ kịch bản về backend
-  const handleSaveAll = async (updatedList = scenarios) => {
+  const handleSaveAll = async (updatedList = scenarios, silent = false): Promise<boolean> => {
     setIsSaving(true);
-    setSaveFeedback(null);
+    if (!silent) setSaveFeedback(null);
     try {
       const res = await fetch(`${apiBase}/api/scenarios`, {
         method: 'POST',
@@ -274,25 +388,30 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
       if (res.ok) {
         setScenarios(updatedList);
         const timeStr = new Date().toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-        setSaveFeedback({
+        if (!silent) setSaveFeedback({
           type: 'success',
           title: 'Lưu Kịch Bản Thành Công!',
           message: `Đã lưu toàn bộ quy trình an toàn lúc ${timeStr}`,
         });
+        return true;
       } else {
         const errorText = await res.text().catch(() => res.statusText);
+        if (silent) throw new Error(`Không lưu được kịch bản (HTTP ${res.status}): ${errorText}`);
         setSaveFeedback({
           type: 'error',
           title: 'Lưu Kịch Bản Thất Bại!',
           message: `Lỗi ${res.status}: ${errorText || 'Không thể lưu kịch bản'}`,
         });
+        return false;
       }
     } catch (e) {
+      if (silent) throw e;
       setSaveFeedback({
         type: 'error',
         title: 'Lỗi Kết Nối Máy Chủ!',
         message: String(e),
       });
+      return false;
     } finally {
       setIsSaving(false);
     }
@@ -300,11 +419,50 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
 
   // Cập nhật kịch bản hiện tại
   const updateActiveScenario = (updater: (prev: Scenario) => Scenario) => {
-    if (!activeScenario) return;
-    const updated = updater({ ...activeScenario });
-    const newList = scenarios.map((s) => (s.id === updated.id ? updated : s));
+    const current = scenariosRef.current.find(s => s.id === selectedId);
+    if (!current) return;
+    const updated = updater({ ...current });
+    const snapshot = (scenario: Scenario) => ({ steps: scenario.steps, connections: scenario.connections, start_step_id: scenario.start_step_id });
+    if (JSON.stringify(snapshot(current)) !== JSON.stringify(snapshot(updated))) {
+      let history = flowHistory.current.get(current.id);
+      if (!history) {
+        history = { past: [], future: [] };
+        flowHistory.current.set(current.id, history);
+      }
+      if (!draggedNodeId || !dragHistoryRecorded.current) {
+        history.past.push(structuredClone(snapshot(current)));
+        if (history.past.length > 100) history.past.shift();
+        history.future = [];
+        if (draggedNodeId) dragHistoryRecorded.current = true;
+      }
+    }
+    const newList = scenariosRef.current.map(s => s.id === updated.id ? updated : s);
+    scenariosRef.current = newList;
     setScenarios(newList);
   };
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!event.ctrlKey || event.altKey || event.metaKey || target?.isContentEditable || target?.closest('input, textarea, select, [contenteditable="true"]')) return;
+      const key = event.key.toLowerCase();
+      const redo = key === 'y' || (key === 'z' && event.shiftKey);
+      if (key !== 'z' && !redo) return;
+      const history = flowHistory.current.get(selectedId);
+      const current = scenariosRef.current.find(s => s.id === selectedId);
+      const source = redo ? history?.future : history?.past;
+      const destination = redo ? history?.past : history?.future;
+      if (!current || !source?.length || !destination) return;
+      event.preventDefault();
+      destination.push(structuredClone({ steps: current.steps, connections: current.connections, start_step_id: current.start_step_id }));
+      const snapshot = source.pop()!;
+      const updated = scenariosRef.current.map(s => s.id === selectedId ? { ...s, ...snapshot } : s);
+      scenariosRef.current = updated;
+      setScenarios(updated);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [selectedId]);
 
   // Thêm kịch bản mới
   const handleAddScenario = () => {
@@ -323,6 +481,31 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
     setScenarios(newList);
     setSelectedId(newId);
     handleSaveAll(newList);
+  };
+
+  const handleCloneScenario = (source: Scenario) => {
+    const copy = structuredClone(source);
+    const id = `sc_${crypto.randomUUID()}`;
+    const stepIds = new Map(copy.steps.map(step => [step.id, `step_${crypto.randomUUID()}`]));
+    copy.id = id;
+    copy.name = `${source.name} (bản sao)`;
+    copy.enabled = false;
+    copy.last_run_time = 0;
+    copy.steps = copy.steps.map(step => ({
+      ...step,
+      id: stepIds.get(step.id)!,
+      target_match_step_id: step.target_match_step_id ? stepIds.get(step.target_match_step_id) || step.target_match_step_id : step.target_match_step_id,
+      loop_target_step_id: step.loop_target_step_id ? stepIds.get(step.loop_target_step_id) || step.loop_target_step_id : step.loop_target_step_id,
+      target_scenario_id: step.target_scenario_id === source.id ? id : step.target_scenario_id,
+    }));
+    copy.start_step_id = copy.start_step_id ? stepIds.get(copy.start_step_id) || copy.start_step_id : copy.start_step_id;
+    copy.connections = copy.connections?.map(connection => ({ ...connection, from_id: stepIds.get(connection.from_id) || connection.from_id, to_id: stepIds.get(connection.to_id) || connection.to_id }));
+    const updated = [...scenariosRef.current];
+    updated.splice(updated.findIndex(item => item.id === source.id) + 1, 0, copy);
+    scenariosRef.current = updated;
+    setScenarios(updated);
+    setSelectedId(id);
+    void handleSaveAll(updated);
   };
 
   // Xóa kịch bản
@@ -376,8 +559,8 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
       newStep.repeat_delay = 0.5;
     } else if (type === 'swipe') {
       newStep.name = '↔️ Vuốt màn hình';
-      newStep.swipe_from = { x: 360, y: 400 };
-      newStep.swipe_to = { x: 360, y: 900 };
+      newStep.swipe_directions = [{ direction: 'up', count: 0 }];
+      newStep.swipe_distance_ratio = 0.12;
       newStep.duration_ms = 400;
     } else if (type === 'delay') {
       newStep.name = '⏳ Chờ đợi';
@@ -448,7 +631,8 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
     if (viewMode !== 'n8n' || !canvasViewportRef.current) return;
     event.preventDefault();
     const rect = canvasViewportRef.current.getBoundingClientRect();
-    const position = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    const target = event.target instanceof Element ? event.target.closest<HTMLElement>('[data-progress-step-id]') : null;
+    const position = { x: event.clientX - rect.left, y: event.clientY - rect.top, stepId: target?.dataset.progressStepId };
     canvasContextMenuRef.current = position;
     setCanvasContextMenu(position);
   };
@@ -475,15 +659,40 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
     };
   }, [canvasContextMenu]);
 
-  const addStepFromCanvasMenu = (type: ActionType) => {
+  const canvasMenuPosition = () => {
     const viewport = canvasViewportRef.current;
     const menuPosition = canvasContextMenuRef.current;
-    if (!viewport || !menuPosition) return;
-    const x = Math.max(16, Math.round((menuPosition.x + viewport.scrollLeft - 16) / canvasZoom));
-    const y = Math.max(16, Math.round((menuPosition.y + viewport.scrollTop - 16) / canvasZoom));
+    if (!viewport || !menuPosition) return null;
+    const viewportRect = viewport.getBoundingClientRect();
+    const innerRect = canvasInnerRef.current?.getBoundingClientRect();
+    return {
+      x: Math.round((viewportRect.left + menuPosition.x - (innerRect?.left ?? viewportRect.left + 16)) / canvasZoom),
+      y: Math.max(16, Math.round((viewportRect.top + menuPosition.y - (innerRect?.top ?? viewportRect.top + 16)) / canvasZoom)),
+    };
+  };
+
+  const addStepFromCanvasMenu = (type: ActionType) => {
+    const position = canvasMenuPosition();
+    if (!position) return;
     canvasContextMenuRef.current = null;
     setCanvasContextMenu(null);
-    handleAddStep(type, { x, y });
+    handleAddStep(type, position);
+  };
+
+  const pasteStepFromCanvasMenu = () => {
+    const position = canvasMenuPosition();
+    if (!position || !copiedStep || !activeScenario) return;
+    const original = copiedStep.step;
+    const id = `step_${crypto.randomUUID()}`;
+    const crossScenario = copiedStep.scenarioId !== activeScenario.id;
+    const copy: ScenarioStep = {
+      ...structuredClone(original), id, name: `${original.name} (bản sao)`, node_x: position.x, node_y: position.y,
+      ...(original.target_match_step_id === original.id ? { target_match_step_id: id } : crossScenario ? { target_match_step_id: '' } : {}),
+      ...(original.loop_target_step_id === original.id ? { loop_target_step_id: id } : crossScenario ? { loop_target_step_id: '' } : {}),
+    };
+    updateActiveScenario((prev) => ({ ...prev, steps: [...prev.steps, copy] }));
+    canvasContextMenuRef.current = null;
+    setCanvasContextMenu(null);
   };
 
   // Xóa một bước
@@ -492,7 +701,10 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
     updateActiveScenario((prev) => ({
       ...prev,
       steps: prev.steps.filter((st) => st.id !== stepId),
+      connections: prev.connections?.filter((connection) => connection.from_id !== stepId && connection.to_id !== stepId),
+      start_step_id: prev.start_step_id === stepId ? '' : prev.start_step_id,
     }));
+    if (connectingFromId === stepId) setConnectingFrom(null);
   };
 
   // Lấy tọa độ hiển thị node trên Canvas n8n
@@ -509,10 +721,57 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
     };
   };
 
+  const routingGeometry = JSON.stringify((activeScenario?.steps || []).map((step, index) => ({ id: step.id, type: step.type, ...getNodePos(step, index), width: 244, height: 172 })));
+  const routingEdges = JSON.stringify(activeScenario?.connections || []);
   const routedConnections = useMemo(() => routeConnections(
-    (activeScenario?.steps || []).map((step, index) => ({ id: step.id, type: step.type, ...getNodePos(step, index), width: 244, height: 172 })),
-    activeScenario?.connections || [],
-  ), [activeScenario?.steps, activeScenario?.connections]);
+    JSON.parse(routingGeometry),
+    JSON.parse(routingEdges),
+  ), [routingGeometry, routingEdges]);
+  const routingWarnings = [...routedConnections.values()].filter(route => route.status !== 'ok');
+  const routeBounds = Array.from(routedConnections.values()).flatMap((route) => route.bounds ? [route.bounds] : []);
+  const canvasLeft = Math.min(0, ...(activeScenario?.steps || []).map((step, i) => getNodePos(step, i).x - 24), ...routeBounds.map((bounds) => bounds.left));
+  const canvasTop = Math.min(0, ...routeBounds.map((bounds) => bounds.top));
+  const canvasRight = Math.max(1, ...(activeScenario?.steps || []).map((step, i) => getNodePos(step, i).x + 268), ...routeBounds.map((bounds) => bounds.right));
+  const canvasBottom = Math.max(1, ...(activeScenario?.steps || []).map((step, i) => getNodePos(step, i).y + 196), ...routeBounds.map((bounds) => bounds.bottom));
+  useLayoutEffect(() => {
+    if (viewMode !== 'n8n' || !activeScenario?.steps.length) return;
+    const viewport = canvasViewportRef.current;
+    if (!viewport) return;
+    const width = Math.max(1, viewport.clientWidth - 32);
+    const height = Math.max(1, viewport.clientHeight - 32);
+    const zoom = Math.min(1, width / (canvasRight - canvasLeft), height / (canvasBottom - canvasTop));
+    setCanvasZoom(Math.max(0.01, Math.floor(zoom * 1000) / 1000));
+    viewport.scrollTo({ left: 0, top: 0 });
+  }, [selectedId, viewMode]);
+  useLayoutEffect(() => {
+    const previous = previousCanvasOrigin.current;
+    const viewport = canvasViewportRef.current;
+    if (draggedNodeId && previous && viewport && previous.scenarioId === selectedId && previous.zoom === canvasZoom) {
+      viewport.scrollLeft += (previous.left - canvasLeft) * canvasZoom;
+      viewport.scrollTop += (previous.top - canvasTop) * canvasZoom;
+    }
+    previousCanvasOrigin.current = { scenarioId: selectedId, left: canvasLeft, top: canvasTop, zoom: canvasZoom };
+  }, [canvasLeft, canvasTop, canvasZoom, draggedNodeId, selectedId]);
+  const handleCloneStep = (stepId: string) => {
+    if (!activeScenario) return;
+    const index = activeScenario.steps.findIndex((step) => step.id === stepId);
+    if (index < 0) return;
+    const original = activeScenario.steps[index];
+    const source = getNodePos(original, index);
+    const occupied = activeScenario.steps.map((step, i) => getNodePos(step, i));
+    let position = { x: source.x + 280, y: source.y };
+    while (occupied.some((point) => Math.abs(point.x - position.x) < 264 && Math.abs(point.y - position.y) < 192)) {
+      position = { x: position.x + 280, y: position.y };
+    }
+    const id = `step_${crypto.randomUUID()}`;
+    const copy: ScenarioStep = {
+      ...structuredClone(original), id, name: `${original.name} (bản sao)`, node_x: position.x, node_y: position.y,
+      ...(original.target_match_step_id === original.id ? { target_match_step_id: id } : {}),
+      ...(original.loop_target_step_id === original.id ? { loop_target_step_id: id } : {}),
+    };
+    updateActiveScenario((prev) => ({ ...prev, steps: [...prev.steps, copy] }));
+  };
+
   const handleAutoLayout = () => {
     if (!activeScenario) {
       return;
@@ -532,26 +791,15 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
     const availableHeight = Math.max(172, (viewport?.clientHeight ?? 700) - 32);
     const cardWidth = 244;
     const cardHeight = 172;
-    const colStep = 340;
-    const rowStep = 300;
-    const layoutFor = (cols: number) => computeOptimalLayout(steps, connections, {
-      startX: START_X,
-      startY: START_Y,
-      colStep,
-      rowStep,
-      maxCols: cols,
+    const columns = Math.max(1, Math.min(4, Math.floor((availableWidth - START_X * 2 - cardWidth) / 340) + 1));
+    const posMap = computeOptimalLayout(steps, connections, {
+      startX: START_X, startY: START_Y, colStep: 340, rowStep: 300,
+      maxCols: columns, startStepId: activeScenario.start_step_id, direction: layoutDirection,
     });
-    const candidates = Array.from({ length: Math.min(4, steps.length) }, (_, index) => {
-      const positions = layoutFor(index + 1);
-      const bounds = [...positions.values()];
-      const width = Math.max(...bounds.map(p => p.x + cardWidth)) + START_X;
-      const height = Math.max(...bounds.map(p => p.y + cardHeight)) + START_Y;
-      return { positions, zoom: Math.min(1, availableWidth / width, availableHeight / height) };
-    });
-    const best = candidates.reduce((a, b) => b.zoom >= a.zoom - 0.02 ? b : a);
-    const posMap = best.positions;
-    setCanvasZoom(Math.max(0.1, Math.floor(best.zoom * 100) / 100));
-
+    const bounds = [...posMap.values()];
+    const width = Math.max(...bounds.map(p => p.x + cardWidth)) + START_X;
+    const height = Math.max(...bounds.map(p => p.y + cardHeight)) + START_Y;
+    setCanvasZoom(Math.max(0.01, Math.floor(Math.min(1, availableWidth / width, availableHeight / height) * 1000) / 1000));
     const updatedSteps = steps.map(st => {
       const p = posMap.get(st.id) || { x: START_X, y: START_Y };
       return { ...st, node_x: Math.round(p.x), node_y: Math.round(p.y) };
@@ -577,9 +825,12 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
     }
     e.preventDefault();
     dragMoveDistance.current = 0;
+    dragHistoryRecorded.current = false;
     setDraggedNodeId(stepId);
     dragStartMouse.current = { x: e.clientX, y: e.clientY };
     dragStartNodePos.current = { ...currentPos };
+    const rect = e.currentTarget.getBoundingClientRect();
+    dragGrabOffset.current = { x: e.clientX - rect.left, y: e.clientY - rect.top };
   };
 
   // Lắng nghe chuột di chuyển và nhả chuột toàn màn hình cho kéo thả Canvas (Tính theo tỷ lệ zoom)
@@ -588,10 +839,11 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
 
     const handleMouseMove = (e: MouseEvent) => {
       dragMoveDistance.current += Math.abs(e.movementX) + Math.abs(e.movementY);
-      const deltaX = (e.clientX - dragStartMouse.current.x) / canvasZoom;
-      const deltaY = (e.clientY - dragStartMouse.current.y) / canvasZoom;
-      const newX = Math.max(10, Math.round(dragStartNodePos.current.x + deltaX));
-      const newY = Math.max(10, Math.round(dragStartNodePos.current.y + deltaY));
+      const inner = canvasInnerRef.current;
+      if (!inner) return;
+      const rect = inner.getBoundingClientRect();
+      const newX = Math.round((e.clientX - rect.left - dragGrabOffset.current.x) / canvasZoom);
+      const newY = Math.max(10, Math.round((e.clientY - rect.top - dragGrabOffset.current.y) / canvasZoom));
 
       updateActiveScenario((prev) => ({
         ...prev,
@@ -782,9 +1034,12 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
       return;
     }
     setRunningScenarioId(activeScenario.id);
+    setIsProgressMinimized(false);
+    setIsProgressPopupOpen(true);
     setRunError(null);
     try {
       await handleSaveAll(); // Tự động lưu trước khi chạy
+      await onClearLogs();
       const response = await fetch(`${apiBase}/api/scenarios/${activeScenario.id}/run`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -821,14 +1076,20 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
       return;
     }
     setTestingStepId(step.id);
+    setIsProgressMinimized(false);
+    setIsProgressPopupOpen(true);
+    setRunError(null);
     try {
-      await fetch(`${apiBase}/api/scenarios/step/test`, {
+      await onClearLogs();
+      const response = await fetch(`${apiBase}/api/scenarios/step/test`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ serial: selectedSerial, step }),
       });
+      if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+      await checkExecutionProgress();
     } catch (e) {
-      alert('Lỗi thử bước: ' + String(e));
+      setRunError('Lỗi thử bước: ' + String(e));
     } finally {
       setTestingStepId(null);
     }
@@ -845,19 +1106,22 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
       return;
     }
     setRunningScenarioId(activeScenario.id);
+    setIsProgressMinimized(false);
+    setIsProgressPopupOpen(true);
+    setRunError(null);
+    setSaveFeedback(null);
     try {
-      await handleSaveAll();
-      const payload = {
-        serial:       selectedSerial,
-        stop_step_id: stepId,
-      };
-      await fetch(`${apiBase}/api/scenarios/${activeScenario.id}/run-until`, {
-        method:  'POST',
+      await handleSaveAll(scenariosRef.current, true);
+      await onClearLogs();
+      const response = await fetch(`${apiBase}/api/scenarios/${activeScenario.id}/run-until`, {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify(payload),
+        body: JSON.stringify({ serial: selectedSerial, stop_step_id: stepId }),
       });
+      if (!response.ok) throw new Error(`Backend trả về HTTP ${response.status}: ${await response.text()}`);
+      await checkExecutionProgress();
     } catch (e) {
-      alert('Lỗi chạy thử nghiệm đến bước: ' + String(e));
+      setRunError('Lỗi chạy từ đầu tới card: ' + String(e));
     } finally {
       setRunningScenarioId(null);
     }
@@ -870,7 +1134,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
       return;
     }
 
-    onStartPick(`✂️ Kéo chuột khoanh vùng để cắt ảnh cho [${step.name}]`, async (point: Point, box?: BoxRegion) => {
+    onStartPick(`✂️ Khoanh vùng: ${step.name}`, async (point: Point, box?: BoxRegion) => {
       const count = (step.templates || []).length + 1;
       const tplName = `crop_${step.id.substring(0, 5)}_${Date.now().toString(36)}_p${count}.png`;
 
@@ -1003,6 +1267,15 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
 
   return (
     <>
+      {previewImage && createPortal(
+        <div role="presentation" onClick={() => setPreviewImage(null)} style={{ position: 'fixed', inset: 0, zIndex: 100000, background: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 }}>
+          <div role="dialog" aria-modal="true" aria-label={`Xem ảnh ${previewImage.name}`} onClick={(event) => event.stopPropagation()} style={{ maxWidth: '95vw', maxHeight: '95vh', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12 }}>
+            <button type="button" onClick={() => setPreviewImage(null)} aria-label="Đóng ảnh" style={{ alignSelf: 'flex-end', cursor: 'pointer', padding: '6px 12px' }}>Đóng ✕</button>
+            <img src={previewImage.src} alt={previewImage.name} style={{ width: 'min(80vw, 800px)', height: '80vh', maxWidth: '90vw', objectFit: 'contain', imageRendering: 'auto', background: '#111827' }} />
+            <span style={{ color: 'white', overflowWrap: 'anywhere' }}>{previewImage.name}</span>
+          </div>
+        </div>, document.body,
+      )}
       <div style={{ display: 'flex', flexDirection: 'column', height: '100%', gap: 10 }}>
       {/* Engine control is displayed in the application header. */}
       <div hidden>
@@ -1070,7 +1343,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4, paddingBottom: 6, borderBottom: '1px solid #1e293b' }}>
             <div>
               <div style={{ fontSize: 12, fontWeight: 700, color: '#f8fafc' }}>DANH SÁCH KỊCH BẢN</div>
-              <div style={{ fontSize: 10, color: '#64748b' }}>Chỉ kịch bản BẬT mới chạy auto</div>
+              <div style={{ fontSize: 10, color: '#64748b' }}>Kéo ⋮⋮ để sắp xếp · Chỉ kịch bản BẬT chạy auto</div>
             </div>
             <button
               onClick={handleAddScenario}
@@ -1126,7 +1399,28 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                 <div
                   key={sc.id}
                   onClick={() => setSelectedId(sc.id)}
+                  onDragOver={(event) => {
+                    if (!draggedScenarioId || draggedScenarioId === sc.id) return;
+                    event.preventDefault();
+                    event.dataTransfer.dropEffect = 'move';
+                    setScenarioDropTarget(sc.id);
+                  }}
+                  onDrop={(event) => {
+                    event.preventDefault();
+                    const from = scenarios.findIndex((item) => item.id === draggedScenarioId);
+                    const to = scenarios.findIndex((item) => item.id === sc.id);
+                    setDraggedScenarioId(null);
+                    setScenarioDropTarget(null);
+                    if (from < 0 || to < 0 || from === to) return;
+                    const updated = [...scenarios];
+                    const [moved] = updated.splice(from, 1);
+                    updated.splice(to, 0, moved);
+                    setScenarios(updated);
+                    void handleSaveAll(updated);
+                  }}
                   style={{
+                    opacity: draggedScenarioId === sc.id ? 0.45 : 1,
+                    outline: scenarioDropTarget === sc.id ? '2px solid #38bdf8' : undefined,
                     padding: '8px 10px',
                     borderRadius: 6,
                     background: scBgColor,
@@ -1141,6 +1435,20 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                 >
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6, maxWidth: 170 }}>
+                      <span
+                        draggable
+                        title="Kéo để thay đổi thứ tự"
+                        aria-label={`Kéo để sắp xếp ${sc.name}`}
+                        onClick={(event) => event.stopPropagation()}
+                        onDragStart={(event) => {
+                          event.stopPropagation();
+                          event.dataTransfer.effectAllowed = 'move';
+                          event.dataTransfer.setData('text/plain', sc.id);
+                          setDraggedScenarioId(sc.id);
+                        }}
+                        onDragEnd={() => { setDraggedScenarioId(null); setScenarioDropTarget(null); }}
+                        style={{ cursor: 'grab', color: '#94a3b8', fontSize: 16, userSelect: 'none', flexShrink: 0 }}
+                      >⋮⋮</span>
                       {isScRunning && (
                         <span style={{ fontSize: 9, background: '#16a34a', color: '#fff', padding: '1px 5px', borderRadius: 8, fontWeight: 900, whiteSpace: 'nowrap' }}>
                           ⚡ CHẠY
@@ -1150,6 +1458,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                         {sc.name}
                       </span>
                     </div>
+                    <button type="button" aria-label={`Nhân bản kịch bản ${sc.name}`} title="Nhân bản kịch bản" onClick={(event) => { event.stopPropagation(); handleCloneScenario(sc); }} style={{ background: 'transparent', border: '1px solid #475569', borderRadius: 4, color: '#7dd3fc', cursor: 'pointer', padding: '2px 6px' }}>⧉</button>
                     <button
                       type="button"
                       onClick={(e) => {
@@ -1177,7 +1486,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                     <span>{sc.steps.length} hành động</span>
                     <span>
                       {sc.enabled
-                        ? (sc.interval_minutes > 0 ? `Lặp mỗi ${sc.interval_minutes}p` : 'Bật (chạy tay)')
+                        ? (sc.interval_minutes > 0 ? `Lặp mỗi ${sc.interval_minutes}p` : 'Chạy 1 lần mỗi phiên auto')
                         : 'Kịch bản con (tắt auto)'}
                     </span>
                   </div>
@@ -1250,7 +1559,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                       fontWeight: 700,
                     }}
                   />
-                  <span>phút</span>
+                  <span>phút {activeScenario.interval_minutes === 0 ? '(1 lần mỗi phiên auto)' : ''}</span>
                 </div>
 
                 {/* Cấu hình lặp lại toàn bộ quy trình (A -> B -> A -> B) */}
@@ -1435,7 +1744,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
             {/* View Mode Switcher: n8n Flow vs List View */}
             {runError && !execState?.is_running && !runningScenarioId && (
               <div role="alert" style={{ margin: '8px 0', padding: '10px 14px', color: '#fecaca', background: '#450a0a', border: '1px solid #ef4444', borderRadius: 6, fontSize: 12 }}>
-                Lỗi kết nối: {runError}
+                {runError}
                 <button type="button" onClick={() => setRunError(null)} style={{ marginLeft: 12, color: '#fee2e2', background: 'transparent', border: 0, cursor: 'pointer' }}>Đóng</button>
               </div>
             )}
@@ -1485,6 +1794,14 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
 
                 {viewMode === 'n8n' && (
                   <>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 5, color: '#cbd5e1', fontSize: 11 }}>
+                      Kiểu xếp
+                      <select aria-label="Kiểu tự động sắp xếp" value={layoutDirection} onChange={(event) => setLayoutDirection(event.target.value as 'horizontal' | 'vertical')}
+                        style={{ background: '#0f172a', color: '#e2e8f0', border: '1px solid #475569', borderRadius: 4, padding: '4px 6px', cursor: 'pointer' }}>
+                        <option value="horizontal">Gọn ngang (tối đa 4 card/hàng)</option>
+                        <option value="vertical">Theo dõi dọc (nhánh If/Else cạnh nhau)</option>
+                      </select>
+                    </label>
                     <button
                       type="button"
                       onClick={handleAutoLayout}
@@ -1501,11 +1818,17 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                         alignItems: 'center',
                         gap: 5,
                       }}
-                      title="Tự động sắp xếp lại các card theo hàng lối ngăn nắp"
+                      title="Sắp xếp các card theo kiểu đã chọn; vị trí mới chỉ được lưu khi bạn lưu kịch bản"
                     >
-                      📐 Tự Động Xếp Lưới
+                      📐 Sắp Xếp
                     </button>
 
+                    <div aria-label="Chú giải cổng nối" style={{ display: 'flex', gap: 7, alignItems: 'center', fontSize: 10, whiteSpace: 'nowrap' }}>
+                      <span style={{ color: '#facc15' }}>■ VÀO</span>
+                      <span style={{ color: '#38bdf8' }}>■ RA</span>
+                      <span style={{ color: '#86efac' }}>■ RA: CÓ</span>
+                      <span style={{ color: '#fda4af' }}>■ RA: KHÔNG</span>
+                    </div>
                     {/* Bộ điều khiển thu phóng Zoom */}
                     <div
                       style={{
@@ -1647,12 +1970,9 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
               <div
                 ref={canvasViewportRef}
                 onContextMenu={handleCanvasContextMenu}
-                onWheel={(event) => {
-                  const delta = event.deltaY < 0 ? 0.08 : -0.08;
-                  setCanvasZoom((prev) => Math.min(2.0, Math.max(0.1, Math.round((prev + delta) * 100) / 100)));
-                }}
                 onMouseDown={(event) => {
-                  if (event.button !== 0 || event.target !== event.currentTarget) return;
+                  const target = event.target as HTMLElement;
+                  if (event.button !== 0 || (target !== event.currentTarget && !target.hasAttribute('data-canvas-background'))) return;
                   const viewport = canvasViewportRef.current;
                   if (!viewport) return;
                   panStateRef.current = { pointerX: event.clientX, pointerY: event.clientY, scrollLeft: viewport.scrollLeft, scrollTop: viewport.scrollTop };
@@ -1666,12 +1986,30 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                   backgroundImage: 'radial-gradient(#1e293b 1.5px, transparent 1.5px)',
                   backgroundSize: `${24 * canvasZoom}px ${24 * canvasZoom}px`,
                   backgroundColor: '#070b14',
+                  cursor: 'grab',
                   borderRadius: 8,
                   padding: 16,
                 }}
               >
                 {canvasContextMenu && (
-                  <div ref={canvasContextMenuElementRef} style={{ position: 'fixed', left: Math.min(window.innerWidth - 380, (canvasViewportRef.current?.getBoundingClientRect().left ?? 0) + canvasContextMenu.x), top: Math.min(window.innerHeight - 480, (canvasViewportRef.current?.getBoundingClientRect().top ?? 0) + canvasContextMenu.y), zIndex: 12001, width: 360, maxHeight: 460, overflowY: 'auto', background: 'rgba(15, 23, 42, 0.98)', border: '1px solid #334155', borderRadius: 8, boxShadow: '0 16px 36px -4px rgba(0,0,0,.85)', padding: '6px 0' }}>
+                  <div ref={canvasContextMenuElementRef} data-canvas-menu style={{ position: 'fixed', left: Math.min(window.innerWidth - 380, (canvasViewportRef.current?.getBoundingClientRect().left ?? 0) + canvasContextMenu.x), top: Math.min(window.innerHeight - 480, (canvasViewportRef.current?.getBoundingClientRect().top ?? 0) + canvasContextMenu.y), zIndex: 12001, width: 360, maxHeight: 460, overflowY: 'auto', background: 'rgba(15, 23, 42, 0.98)', border: '1px solid #334155', borderRadius: 8, boxShadow: '0 16px 36px -4px rgba(0,0,0,.85)', padding: '6px 0' }}>
+                      {canvasContextMenu.stepId ? (
+                        <>
+                        <button type="button" onClick={() => {
+                          const stepId = canvasContextMenu.stepId!;
+                          updateActiveScenario((prev) => ({ ...prev, start_step_id: prev.start_step_id === stepId ? '' : stepId }));
+                          canvasContextMenuRef.current = null;
+                          setCanvasContextMenu(null);
+                        }} style={{ display: 'block', width: '100%', padding: '10px 12px', border: 0, borderBottom: '1px solid #334155', color: '#fbbf24', background: 'transparent', textAlign: 'left', cursor: 'pointer' }}>{activeScenario.start_step_id === canvasContextMenu.stepId ? 'Bỏ đánh dấu bắt đầu' : 'Đặt làm card bắt đầu'}</button>
+                        <button type="button" onClick={() => {
+                          const step = activeScenario.steps.find((item) => item.id === canvasContextMenu.stepId);
+                          if (step) setCopiedStep({ step: structuredClone(step), scenarioId: activeScenario.id });
+                          canvasContextMenuRef.current = null;
+                          setCanvasContextMenu(null);
+                        }} style={{ display: 'block', width: '100%', padding: '10px 12px', border: 0, color: '#e2e8f0', background: 'transparent', textAlign: 'left', cursor: 'pointer' }}>Copy card</button>
+                        </>
+                      ) : <>
+                      <button type="button" disabled={!copiedStep} onClick={pasteStepFromCanvasMenu} style={{ display: 'block', width: '100%', padding: '10px 12px', border: 0, borderBottom: '1px solid #334155', color: copiedStep ? '#7dd3fc' : '#64748b', background: 'transparent', textAlign: 'left', cursor: copiedStep ? 'pointer' : 'not-allowed' }}>Paste card{copiedStep ? ` — ${copiedStep.step.name}` : ''}</button>
                       <div style={{ padding: '8px 12px', borderBottom: '1px solid #1e293b', color: '#38bdf8', fontSize: 11, fontWeight: 800 }}>CHỌN HÀNH ĐỘNG ĐỂ THÊM TẠI ĐÂY</div>
                       {ACTION_GROUPS.map((group) => (
                         <div key={group.category}>
@@ -1683,25 +2021,29 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                           ))}
                         </div>
                       ))}
+                      </>}
                     </div>
                   )}
                 {activeScenario.steps.length === 0 ? (
-                  <div style={{ textAlign: 'center', padding: '60px 0', color: '#64748b', fontSize: 13 }}>
+                  <div data-canvas-background style={{ textAlign: 'center', padding: '60px 0', color: '#64748b', fontSize: 13 }}>
                     Kịch bản chưa có hành động nào. Nhấp chuột phải vào vùng workflow để thêm hành động.
                   </div>
                 ) : (
-                  <div style={{
+                  <div data-canvas-background style={{
                     position: 'relative',
                     marginInline: 'auto',
-                    width: Math.max(1, ...activeScenario.steps.map((st, i) => getNodePos(st, i).x + 268)) * canvasZoom,
-                    height: Math.max(1, ...activeScenario.steps.map((st, i) => getNodePos(st, i).y + 196)) * canvasZoom,
+                    width: (canvasRight - canvasLeft) * canvasZoom,
+                    height: (canvasBottom - canvasTop) * canvasZoom,
                   }}>
                   <div
                     ref={canvasInnerRef}
+                    data-canvas-background
                     style={{
-                      position: 'relative',
-                      width: Math.max(1, ...activeScenario.steps.map((st, i) => getNodePos(st, i).x + 268)),
-                      height: Math.max(1, ...activeScenario.steps.map((st, i) => getNodePos(st, i).y + 196)),
+                      position: 'absolute',
+                      left: -canvasLeft * canvasZoom,
+                      top: -canvasTop * canvasZoom,
+                      width: canvasRight,
+                      height: canvasBottom,
                       transform: `scale(${canvasZoom})`,
                       transformOrigin: 'top left',
                     }}
@@ -1749,7 +2091,12 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                       </div>
                     )}
 
-                    {/* SVG Bezier Curves connecting lines */}
+                    {routingWarnings.length > 0 && (
+                      <div role="alert" style={{ position: 'sticky', top: 8, left: 8, zIndex: 110, background: '#78350f', color: '#fef3c7', padding: 8, maxWidth: 460 }}>
+                        {routingWarnings.length} kết nối không vẽ được: {routingWarnings.filter(route => route.status === 'invalid').length} thiếu bước đích/nguồn, {routingWarnings.filter(route => route.status === 'blocked').length} bị card chắn. Di chuyển card hoặc xóa/nối lại liên kết lỗi. Rê chuột vào nút xóa để xem chi tiết.
+                      </div>
+                    )}
+                    {/* Orthogonal routes with explicit crossing bridges. */}
                     <svg
                       style={{
                         position: 'absolute',
@@ -1757,6 +2104,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                         left: 0,
                         width: '100%',
                         height: '100%',
+                        overflow: 'visible',
                         pointerEvents: 'none',
                         zIndex: 10,
                       }}
@@ -1801,9 +2149,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                       {/* Hiển thị các mũi tên do người dùng nối (có phân loại nhánh True/False/Default) */}
                       {(() => {
                         return (activeScenario.connections || []).map((conn, connectionIndex) => {
-                          const stepA = activeScenario.steps.find((s) => s.id === conn.from_id);
-                          const stepB = activeScenario.steps.find((s) => s.id === conn.to_id);
-                          if (!stepA || !stepB) return null;
+
 
                           const connBranch = conn.branch || 'default';
                           const route = routedConnections.get(connectionKey(conn, connectionIndex));
@@ -1843,6 +2189,13 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                             shadowStyle = 'drop-shadow(0 0 3px rgba(244, 63, 94, 0.85))';
                           }
 
+                          const isSelectedConnection = selectedFlowStep?.scenarioId === selectedId &&
+                            (conn.from_id === selectedFlowStep.stepId || conn.to_id === selectedFlowStep.stepId);
+                          if (isSelectedConnection) {
+                            lineWidth = '5';
+                            shadowStyle = `drop-shadow(0 0 5px ${strokeColor}) drop-shadow(0 0 10px ${strokeColor})`;
+                          }
+
                           if (isConnActive) {
                             strokeColor = '#00f0ff';
                             lineWidth = '3.5';
@@ -1852,8 +2205,10 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                           }
 
                           return (
-                            <g key={`conn-${conn.from_id}-${conn.to_id}-${connBranch}`}>
+                            <g key={connectionKey(conn, connectionIndex)} data-connection-key={connectionKey(conn, connectionIndex)} data-routing-status={route.status}>
+                              <title>{route.warning || `${conn.from_id} -> ${conn.to_id} (${connBranch})`}</title>
                               <path
+                                data-workflow-wire="true"
                                 d={pathD}
                                 stroke={strokeColor}
                                 strokeWidth={lineWidth}
@@ -1888,7 +2243,8 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                                       padding: 0,
                                       boxShadow: '0 2px 6px rgba(0,0,0,0.8)',
                                     }}
-                                    title="Bấm để xóa mũi tên liên kết này"
+                                    aria-label={`Xóa liên kết ${conn.from_id} -> ${conn.to_id} (${connBranch})`}
+                                    title={route.warning ? `${conn.from_id} -> ${conn.to_id}: ${route.warning}` : 'Bấm để xóa mũi tên liên kết này'}
                                   >
                                     ✕
                                   </button>
@@ -1898,6 +2254,16 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                           );
                         });
                       })()}
+
+                      {/* Draw crossing bridges above all wires, independently of edge order. */}
+                      {[...routedConnections.entries()].flatMap(([key, route]) => route.bridgePaths.map((path, index) => {
+                        const branch = JSON.parse(key)[2];
+                        const color = branch === 'true' ? '#22c55e' : branch === 'false' ? '#f43f5e' : '#38bdf8';
+                        return <g key={key + ':' + index} data-wire-bridge="true">
+                          <path d={path} stroke="#020617" strokeWidth={7} fill="none" />
+                          <path d={path} stroke={color} strokeWidth={2.2} fill="none" />
+                        </g>;
+                      }))}
 
                       {/* Live Drawing Arrow khi người dùng đang kéo chuột từ cổng OUT */}
                       {connectingFromId && (() => {
@@ -1924,10 +2290,9 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                           const falseTarget = activeScenario.connections?.find((c) => c.from_id === sourceNode.id && c.branch === 'false');
                           const trueStep = trueTarget && activeScenario.steps.find((step) => step.id === trueTarget.to_id);
                           const falseStep = falseTarget && activeScenario.steps.find((step) => step.id === falseTarget.to_id);
-                          if (trueStep && falseStep) return getNodePos(trueStep, activeScenario.steps.indexOf(trueStep)).x > getNodePos(falseStep, activeScenario.steps.indexOf(falseStep)).x;
-                          if (trueStep) return getNodePos(trueStep, activeScenario.steps.indexOf(trueStep)).x > p1.x + 120;
-                          if (falseStep) return getNodePos(falseStep, activeScenario.steps.indexOf(falseStep)).x < p1.x + 60;
-                          return false;
+                          return swapBranchPorts(p1.x,
+                            trueStep ? getNodePos(trueStep, activeScenario.steps.indexOf(trueStep)).x : undefined,
+                            falseStep ? getNodePos(falseStep, activeScenario.steps.indexOf(falseStep)).x : undefined);
                         })();
                         const isMouseBelow = endY >= p1.y + 100;
 
@@ -2031,46 +2396,21 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                           const route = routedConnections.get(connectionKey(c,index));
                           return direction === 'in' ? c.to_id === step.id && route?.targetSide === side : c.from_id === step.id && route?.sourceSide === side;
                         });
-                        const hasLeftIn = hasPort('in','left');
-                        const hasTopIn = hasPort('in','top');
-                        const hasRightIn = hasPort('in','right');
+                        const inboundPorts = activeConns.flatMap((c, index) => {
+                          const route = routedConnections.get(connectionKey(c, index));
+                          return c.to_id === step.id && route?.targetPort ? [{ key: connectionKey(c, index), point: route.targetPort }] : [];
+                        });
                         const hasLeftOut = hasPort('out','left');
                         const hasRightOut = hasPort('out','right');
                         const hasBottomOut = hasPort('out','bottom');
 
-                        // Tự động hoán đổi vị trí nút CÓ / KHÔNG dựa theo vị trí tương đối của card đích để dây chạy thẳng hàng nhất:
-                        // Mặc định: CÓ ở x=60 (trái), KHÔNG ở x=180 (phải)
-                        // Nếu nhánh CÓ nối sang card nằm bên phải hơn so với card của nhánh KHÔNG => Tự động cho KHÔNG ở x=60, CÓ ở x=180
                         const trueConn = activeConns.find((c) => c.from_id === step.id && c.branch === 'true');
                         const falseConn = activeConns.find((c) => c.from_id === step.id && c.branch === 'false');
-                        let swapCoKhong = false;
-                        if (trueConn && falseConn) {
-                          const targetTrue = stepMap.get(trueConn.to_id);
-                          const targetFalse = stepMap.get(falseConn.to_id);
-                          if (targetTrue && targetFalse) {
-                            const pTrue = getNodePos(targetTrue, activeScenario.steps.indexOf(targetTrue));
-                            const pFalse = getNodePos(targetFalse, activeScenario.steps.indexOf(targetFalse));
-                            if (pTrue.x > pFalse.x) {
-                              swapCoKhong = true;
-                            }
-                          }
-                        } else if (trueConn && !falseConn) {
-                          const targetTrue = stepMap.get(trueConn.to_id);
-                          if (targetTrue) {
-                            const pTrue = getNodePos(targetTrue, activeScenario.steps.indexOf(targetTrue));
-                            if (pTrue.x > pos.x + 120) {
-                              swapCoKhong = true;
-                            }
-                          }
-                        } else if (!trueConn && falseConn) {
-                          const targetFalse = stepMap.get(falseConn.to_id);
-                          if (targetFalse) {
-                            const pFalse = getNodePos(targetFalse, activeScenario.steps.indexOf(targetFalse));
-                            if (pFalse.x < pos.x + 60) {
-                              swapCoKhong = true;
-                            }
-                          }
-                        }
+                        const targetTrue = trueConn && stepMap.get(trueConn.to_id);
+                        const targetFalse = falseConn && stepMap.get(falseConn.to_id);
+                        const swapCoKhong = swapBranchPorts(pos.x,
+                          targetTrue ? getNodePos(targetTrue, activeScenario.steps.indexOf(targetTrue)).x : undefined,
+                          targetFalse ? getNodePos(targetFalse, activeScenario.steps.indexOf(targetFalse)).x : undefined);
 
                         let nodeBorderColor = '#38bdf8';
                       let nodeBgColor = '#0f172a';
@@ -2148,8 +2488,11 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                         cardBg = '#3b2505';
                       }
 
+                      const isHighlighted = highlightedStep?.scenarioId === selectedId && highlightedStep.stepId === step.id;
                       let cardBorder = `1px solid ${nodeBorderColor}`;
-                      if (isStepRunning) {
+                      if (isHighlighted) {
+                        cardBorder = '3px solid #fbbf24';
+                      } else if (isStepRunning) {
                         cardBorder = '2.5px solid #00f0ff';
                       } else if (isPickingThis) {
                         cardBorder = '2px solid #f59e0b';
@@ -2158,7 +2501,9 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                       }
 
                       let cardBoxShadow = '0 4px 12px rgba(0, 0, 0, 0.45)';
-                      if (isStepRunning) {
+                      if (isHighlighted) {
+                        cardBoxShadow = '0 0 28px rgba(251, 191, 36, 0.95), inset 0 0 18px rgba(251, 191, 36, 0.3)';
+                      } else if (isStepRunning) {
                         cardBoxShadow = '0 0 25px #00f0ff, 0 0 50px rgba(0, 240, 255, 0.8), inset 0 0 15px rgba(0, 240, 255, 0.4)';
                       } else if (draggedNodeId === step.id) {
                         cardBoxShadow = '0 8px 24px rgba(56, 189, 248, 0.4)';
@@ -2172,11 +2517,10 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                       return (
                         <div
                           key={step.id}
+                          data-progress-step-id={step.id}
                           onMouseDown={(e) => {
-                            if (e.button === 0 && !connectingFromId) {
-                              const viewport = canvasViewportRef.current;
-                              if (viewport) panStateRef.current = { pointerX: e.clientX, pointerY: e.clientY, scrollLeft: viewport.scrollLeft, scrollTop: viewport.scrollTop };
-                            }
+                            e.stopPropagation();
+                            panStateRef.current = null;
                             handleNodeMouseDown(e, step.id, pos);
                           }}
                           onMouseUp={(e) => {
@@ -2190,7 +2534,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                               handleAddConnection(connectingFromId, step.id, connectingBranch);
                               return;
                             }
-                            setEditingStepId(step.id);
+                            setSelectedFlowStep({ scenarioId: selectedId, stepId: step.id });
                           }}
                           style={{
                             position: 'absolute',
@@ -2213,102 +2557,27 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                             transform: 'none',
                             transition: draggedNodeId === step.id ? 'none' : 'box-shadow 0.18s ease-in-out, transform 0.18s ease-in-out',
                             userSelect: 'none',
-                            zIndex: isStepRunning ? 90 : draggedNodeId === step.id ? 99 : 2,
+                            zIndex: isHighlighted ? 95 : isStepRunning ? 90 : draggedNodeId === step.id ? 99 : 2,
                           }}
                           title="Nhấp giữ chuột để kéo thả vị trí tùy ý. Nhấn vào để mở cấu hình chi tiết."
                         >
-                          {/* Cổng Vào (IN Bên Trái) - Nhận mũi tên từ Card bên trái */}
-                          {(hasLeftIn || connectingFromId) && (
-                            <div
+                          {inboundPorts.map(({ key, point }) => (
+                            <div key={key} data-inbound-port={key}
                               onMouseUp={(e) => handleEndConnect(e, step.id)}
                               onClick={(e) => e.stopPropagation()}
-                              style={{
-                                width: 11,
-                                height: 11,
-                                borderRadius: '50%',
-                                background: connectingFromId && connectingFromId !== step.id ? '#38bdf8' : '#0284c7',
-                                border: '1.5px solid #020617',
-                                position: 'absolute',
-                                top: '50%',
-                                left: -5.5,
-                                transform: 'translateY(-50%)',
-                                cursor: connectingFromId ? 'pointer' : 'default',
-                                boxShadow: connectingFromId && connectingFromId !== step.id ? '0 0 10px #38bdf8' : '0 0 5px #0284c7',
-                                display: 'flex',
-                                alignItems: 'center',
-                                justifyContent: 'center',
-                                fontSize: 7,
-                                color: '#fff',
-                                fontWeight: 900,
-                                zIndex: 10,
-                              }}
-                              title="🔵 CỔNG VÀO HÔNG (IN): Nhả chuột vào đây để nối từ Card bên trái"
-                            >
-                              ▶
-                            </div>
+                              title="VÀO (INPUT): Thả dây nối vào đây"
+                              style={{ position: 'absolute', left: point.x - pos.x, top: point.y - pos.y,
+                                width: 28, height: 16, boxSizing: 'border-box', transform: 'translate(-50%, -50%)',
+                                borderRadius: 4, background: '#854d0e', color: '#fef08a', fontSize: 8, fontWeight: 900,
+                                border: '1.5px solid #facc15', zIndex: 10, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>VÀO</div>
+                          ))}
+                          {connectingFromId && connectingFromId !== step.id && (
+                            <div onMouseUp={(e) => handleEndConnect(e, step.id)} onClick={(e) => e.stopPropagation()}
+                              title="Nha chuot vao card de noi"
+                              style={{ position: 'absolute', left: '50%', top: -6, width: 12, height: 12,
+                                borderRadius: '50%', background: '#38bdf8', zIndex: 10 }} />
                           )}
 
-                          {/* Cổng Vào (IN Trên Đỉnh) - Nhận mũi tên từ Card phía trên */}
-                          {(hasTopIn || connectingFromId) && (
-                            <div
-                              onMouseUp={(e) => handleEndConnect(e, step.id)}
-                              onClick={(e) => e.stopPropagation()}
-                              style={{
-                                width: 11,
-                                height: 11,
-                                borderRadius: '50%',
-                                background: connectingFromId && connectingFromId !== step.id ? '#38bdf8' : '#0284c7',
-                                border: '1.5px solid #020617',
-                                position: 'absolute',
-                                top: -5.5,
-                                left: '50%',
-                                transform: 'translateX(-50%)',
-                                cursor: connectingFromId ? 'pointer' : 'default',
-                                boxShadow: connectingFromId && connectingFromId !== step.id ? '0 0 10px #38bdf8' : '0 0 5px #0284c7',
-                                display: 'flex',
-                                alignItems: 'center',
-                                justifyContent: 'center',
-                                fontSize: 7,
-                                color: '#fff',
-                                fontWeight: 900,
-                                zIndex: 10,
-                              }}
-                              title="🔵 CỔNG VÀO TRÊN (IN): Nhả chuột vào đây để nối từ Card phía trên"
-                            >
-                              ▼
-                            </div>
-                          )}
-
-                          {/* Cổng Vào (IN Bên Phải) - Nhận mũi tên từ Card bên phải hoặc vòng lặp ngược lên */}
-                          {(hasRightIn || connectingFromId) && (
-                            <div
-                              onMouseUp={(e) => handleEndConnect(e, step.id)}
-                              onClick={(e) => e.stopPropagation()}
-                              style={{
-                                width: 11,
-                                height: 11,
-                                borderRadius: '50%',
-                                background: connectingFromId && connectingFromId !== step.id ? '#38bdf8' : '#0284c7',
-                                border: '1.5px solid #020617',
-                                position: 'absolute',
-                                top: '50%',
-                                right: -5.5,
-                                transform: 'translateY(-50%)',
-                                cursor: connectingFromId ? 'pointer' : 'default',
-                                boxShadow: connectingFromId && connectingFromId !== step.id ? '0 0 10px #38bdf8' : '0 0 5px #0284c7',
-                                display: 'flex',
-                                alignItems: 'center',
-                                justifyContent: 'center',
-                                fontSize: 7,
-                                color: '#fff',
-                                fontWeight: 900,
-                                zIndex: 10,
-                              }}
-                              title="🔵 CỔNG VÀO HÔNG PHẢI (IN): Nhả chuột vào đây để nối từ Card bên phải"
-                            >
-                              ◀
-                            </div>
-                          )}
 
                           {/* Cổng Ra (OUT): Với If/Else & Kịch Bản Con đặt 2 CỔNG THÀNH CÔNG / THẤT BẠI (CÓ / KHÔNG) Ở MÉP DƯỚI CARD. Với bước Finish thì KHÔNG có cổng ra. */}
                           {step.type === 'finish' ? null : (step.type === 'if_template' || step.type === 'run_scenario') ? (() => {
@@ -2377,10 +2646,10 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                                     zIndex: 20,
                                     userSelect: 'none',
                                   }}
-                                  title={step.type === 'run_scenario' ? "🟢 CỔNG THÀNH CÔNG: Kéo chuột sang bước kế tiếp khi KỊCH BẢN CON THÀNH CÔNG" : "🟢 CỔNG CÓ (ĐÚNG): Kéo chuột sang bước kế tiếp khi TÌM THẤY ẢNH"}
+                                  title={step.type === 'run_scenario' ? "CỔNG RA (OUT) THÀNH CÔNG: Kéo sang bước kế tiếp" : "CỔNG RA (OUT) CÓ: Kéo sang bước kế tiếp khi tìm thấy ảnh"}
                                 >
                                   <span style={{ fontSize: 9 }}>✔</span>
-                                  <span>{trueLabel}</span>
+                                  <span>RA: {trueLabel}</span>
                                 </div>
 
                                 {/* Cổng KHÔNG / THẤT BẠI (False) - Tự động linh hoạt nằm trái hoặc phải */}
@@ -2415,10 +2684,10 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                                     zIndex: 20,
                                     userSelect: 'none',
                                   }}
-                                  title={step.type === 'run_scenario' ? "🔴 CỔNG THẤT BẠI: Kéo chuột sang bước kế tiếp khi KỊCH BẢN CON THẤT BẠI" : "🔴 CỔNG KHÔNG (SAI): Kéo chuột sang bước kế tiếp khi KHÔNG TÌM THẤY ẢNH"}
+                                  title={step.type === 'run_scenario' ? "CỔNG RA (OUT) THẤT BẠI: Kéo sang bước kế tiếp" : "CỔNG RA (OUT) KHÔNG: Kéo sang bước kế tiếp khi không tìm thấy ảnh"}
                                 >
                                   <span style={{ fontSize: 9 }}>✖</span>
-                                  <span>{falseLabel}</span>
+                                  <span>RA: {falseLabel}</span>
                                 </div>
                               </>
                             );
@@ -2437,14 +2706,14 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                                     }
                                   }}
                                   style={{
-                                    width: 11,
-                                    height: 11,
-                                    borderRadius: '50%',
-                                    background: connectingFromId === step.id ? '#f59e0b' : '#38bdf8',
-                                    border: '1.5px solid #020617',
+                                    width: 28,
+                                    height: 16,
+                                    borderRadius: 4,
+                                    background: connectingFromId === step.id ? '#f59e0b' : '#0369a1',
+                                    border: '1.5px solid #38bdf8',
                                     position: 'absolute',
                                     top: '50%',
-                                    left: -5.5,
+                                    left: -14,
                                     transform: 'translateY(-50%)',
                                     cursor: 'crosshair',
                                     boxShadow: connectingFromId === step.id ? '0 0 10px #f59e0b' : '0 0 6px #38bdf8',
@@ -2452,13 +2721,13 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                                     alignItems: 'center',
                                     justifyContent: 'center',
                                     fontSize: 8,
-                                    color: '#000',
+                                    color: '#fff',
                                     fontWeight: 900,
                                     zIndex: 10,
                                   }}
-                                  title="🔵 CỔNG RA TRÁI (OUT): Kéo chuột từ đây để nối mũi tên sang Card bên trái"
+                                  title="RA (OUTPUT): Kéo dây từ đây sang card khác"
                                 >
-                                  +
+                                  RA
                                 </div>
                               )}
 
@@ -2474,14 +2743,14 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                                     }
                                   }}
                                   style={{
-                                    width: 11,
-                                    height: 11,
-                                    borderRadius: '50%',
-                                    background: connectingFromId === step.id ? '#f59e0b' : '#38bdf8',
-                                    border: '1.5px solid #020617',
+                                    width: 28,
+                                    height: 16,
+                                    borderRadius: 4,
+                                    background: connectingFromId === step.id ? '#f59e0b' : '#0369a1',
+                                    border: '1.5px solid #38bdf8',
                                     position: 'absolute',
                                     top: '50%',
-                                    right: -5.5,
+                                    right: -14,
                                     transform: 'translateY(-50%)',
                                     cursor: 'crosshair',
                                     boxShadow: connectingFromId === step.id ? '0 0 10px #f59e0b' : '0 0 6px #38bdf8',
@@ -2489,13 +2758,13 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                                     alignItems: 'center',
                                     justifyContent: 'center',
                                     fontSize: 8,
-                                    color: '#000',
+                                    color: '#fff',
                                     fontWeight: 900,
                                     zIndex: 10,
                                   }}
-                                  title="🔵 CỔNG RA PHẢI (OUT): Kéo chuột từ đây để nối mũi tên sang Card bên phải"
+                                  title="RA (OUTPUT): Kéo dây từ đây sang card khác"
                                 >
-                                  +
+                                  RA
                                 </div>
                               )}
 
@@ -2512,13 +2781,13 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                                     }
                                   }}
                                   style={{
-                                    width: 11,
-                                    height: 11,
-                                    borderRadius: '50%',
-                                    background: connectingFromId === step.id ? '#f59e0b' : '#38bdf8',
-                                    border: '1.5px solid #020617',
+                                    width: 28,
+                                    height: 16,
+                                    borderRadius: 4,
+                                    background: connectingFromId === step.id ? '#f59e0b' : '#0369a1',
+                                    border: '1.5px solid #38bdf8',
                                     position: 'absolute',
-                                    bottom: -5.5,
+                                    bottom: -8,
                                     left: '50%',
                                     transform: 'translateX(-50%)',
                                     cursor: 'crosshair',
@@ -2527,13 +2796,13 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                                     alignItems: 'center',
                                     justifyContent: 'center',
                                     fontSize: 8,
-                                    color: '#000',
+                                    color: '#fff',
                                     fontWeight: 900,
                                     zIndex: 10,
                                   }}
-                                  title="🔵 CỔNG RA DƯỚI (OUT): Kéo chuột từ đây để nối mũi tên xuống Card bên dưới"
+                                  title="RA (OUTPUT): Kéo dây từ đây sang card khác"
                                 >
-                                  +
+                                  RA
                                 </div>
                               )}
                             </>
@@ -2563,7 +2832,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                                 }}
                                 title={`#${idx + 1} ${nodeTypeLabel}`}
                               >
-                                #{idx + 1} {nodeIcon} {nodeTypeLabel}
+                                {activeScenario.start_step_id === step.id ? '🏁 ' : ''}#{idx + 1} {nodeIcon} {nodeTypeLabel}
                               </span>
                             </div>
 
@@ -2575,7 +2844,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                               <button
                                 type="button"
                                 onClick={() => handleRunUntilStep(step.id)}
-                                disabled={Boolean(execState?.is_running)}
+                                disabled={Boolean(execState?.is_running || runningScenarioId || isRunningEngine || engineRunning)}
                                 style={{
                                   minWidth: 28,
                                   height: 26,
@@ -2585,7 +2854,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                                   color: '#fbbf24',
                                   border: '1px solid #d97706',
                                   borderRadius: 4,
-                                  cursor: Boolean(execState?.is_running) ? 'not-allowed' : 'pointer',
+                                  cursor: Boolean(execState?.is_running || runningScenarioId || isRunningEngine || engineRunning) ? 'not-allowed' : 'pointer',
                                   fontWeight: 700,
                                   display: 'flex',
                                   alignItems: 'center',
@@ -2641,6 +2910,15 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                                 title="Cấu hình chi tiết"
                               >
                                 ⚙️
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleCloneStep(step.id)}
+                                title="Nhân bản card"
+                                aria-label={`Nhân bản ${step.name}`}
+                                style={{ minWidth: 28, height: 26, padding: '2px 6px', fontSize: 14, background: '#1e293b', color: '#7dd3fc', border: '1px solid #0369a1', borderRadius: 4, cursor: 'pointer' }}
+                              >
+                                ⧉
                               </button>
                               <button
                                 type="button"
@@ -2744,8 +3022,14 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                                           key={tpl + tIdx}
                                           src={`${apiBase}/api/auto/template/image/${tpl}?t=${refreshImgKey}`}
                                           alt={tpl}
-                                          title={tpl}
+                                          title={`Bấm để xem lớn: ${tpl}`}
+                                          role="button"
+                                          tabIndex={0}
+                                          onMouseDown={(event) => event.stopPropagation()}
+                                          onClick={(event) => { event.stopPropagation(); setPreviewImage({ src: event.currentTarget.src, name: tpl }); }}
+                                          onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); setPreviewImage({ src: event.currentTarget.src, name: tpl }); } }}
                                           style={{
+                                            cursor: 'zoom-in',
                                             width: 36,
                                             height: 36,
                                             borderRadius: 5,
@@ -2797,8 +3081,14 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                                         key={tpl + tIdx}
                                         src={`${apiBase}/api/auto/template/image/${tpl}?t=${refreshImgKey}`}
                                         alt={tpl}
-                                        title={tpl}
+                                        title={`Bấm để xem lớn: ${tpl}`}
+                                        role="button"
+                                        tabIndex={0}
+                                        onMouseDown={(event) => event.stopPropagation()}
+                                        onClick={(event) => { event.stopPropagation(); setPreviewImage({ src: event.currentTarget.src, name: tpl }); }}
+                                        onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); setPreviewImage({ src: event.currentTarget.src, name: tpl }); } }}
                                         style={{
+                                          cursor: 'zoom-in',
                                           width: 36,
                                           height: 36,
                                           borderRadius: 5,
@@ -2843,8 +3133,25 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                             )}
 
                             {step.type === 'swipe' && (
-                              <div style={{ color: '#d8b4fe', fontSize: 10 }}>
-                                ({step.swipe_from?.x}, {step.swipe_from?.y}) ➔ ({step.swipe_to?.x}, {step.swipe_to?.y})
+                              <div onMouseDown={e => e.stopPropagation()} onClick={e => e.stopPropagation()} style={{ display: 'flex', justifyContent: 'center', width: '100%', gap: 3, alignItems: 'center', flexWrap: 'wrap', color: '#d8b4fe', fontSize: 10 }}>
+                                {(['up', 'down', 'left', 'right'] as const).map((direction, index) => {
+                                  const count = step.swipe_directions?.find(item => item.direction === direction)?.count ?? 0;
+                                  return <label key={direction} title={['Lên', 'Xuống', 'Trái', 'Phải'][index]} style={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    {['↑', '↓', '←', '→'][index]}
+                                    <input type="number" min={0} max={100} aria-label={`Số lần vuốt ${['lên', 'xuống', 'trái', 'phải'][index]}`} value={count} onChange={event => {
+                                      const raw = Number(event.target.value);
+                                      const value = Number.isFinite(raw) ? Math.max(0, Math.min(100, Math.floor(raw))) : 0;
+                                      updateActiveScenario(prev => ({ ...prev, steps: prev.steps.map(st => {
+                                        if (st.id !== step.id) return st;
+                                        const counts = Object.fromEntries((st.swipe_directions || []).map(item => [item.direction, item.count]));
+                                        counts[direction] = Math.min(value, 100 - Object.entries(counts).filter(([key]) => key !== direction).reduce((total, [, n]) => total + Number(n), 0));
+                                        const directions = (['up', 'down', 'left', 'right'] as const).filter(key => counts[key] > 0).map(key => ({ direction: key, count: counts[key] }));
+                                        return { ...st, swipe_directions: directions.length ? directions : [{ direction: 'up', count: 0 }], swipe_distance_ratio: 0.12 };
+                                      }) }));
+                                    }} style={{ width: 26, padding: 1, color: '#fff', background: '#1e293b', border: '1px solid #64748b', borderRadius: 3 }} />
+                                  </label>;
+                                })}
+                                {!step.swipe_directions?.length && <span title="Card cũ sẽ tiếp tục vuốt theo tọa độ">Tọa độ cũ</span>}
                               </div>
                             )}
 
@@ -2935,7 +3242,11 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                     let listBoxShadow = 'none';
                     let listAnimation = 'none';
 
-                    if (isStepRunning) {
+                    if (highlightedStep?.scenarioId === selectedId && highlightedStep.stepId === step.id) {
+                      listBg = '#33270a';
+                      listBorder = '2px solid #fbbf24';
+                      listBoxShadow = '0 0 20px rgba(251, 191, 36, 0.8)';
+                    } else if (isStepRunning) {
                       listBg = '#032338';
                       listBorder = '2px solid #00f0ff';
                       listBoxShadow = '0 0 20px rgba(0, 240, 255, 0.7)';
@@ -2951,6 +3262,7 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                     return (
                       <div
                         key={step.id}
+                        data-progress-step-id={step.id}
                         draggable
                         onDragStart={(e) => handleDragStart(e, idx)}
                         onDragOver={handleDragOver}
@@ -3774,37 +4086,29 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
                       )}
 
                       {step.type === 'swipe' && (
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: 10, background: '#1c0c29', padding: 12, borderRadius: 6, border: '1px solid #701a75' }}>
-                          <span style={{ color: '#d946ef', fontWeight: 700, fontSize: 13 }}>↔️ Vuốt Màn Hình (Swipe)</span>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                            <span style={{ fontSize: 12, color: '#94a3b8' }}>Từ ({step.swipe_from?.x}, {step.swipe_from?.y})</span>
-                            <span style={{ fontSize: 12, color: '#94a3b8' }}>➔ Đến ({step.swipe_to?.x}, {step.swipe_to?.y})</span>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                onStartPick(step.name + ' (Bắt đầu)', (p1) => {
-                                  updateActiveScenario((prev) => ({
-                                    ...prev,
-                                    steps: prev.steps.map((st) => (st.id === step.id ? { ...st, swipe_from: p1 } : st)),
-                                  }));
-                                  setTimeout(() => {
-                                    onStartPick(step.name + ' (Kết thúc)', (p2) => {
-                                      updateActiveScenario((prev) => ({
-                                        ...prev,
-                                        steps: prev.steps.map((st) => (st.id === step.id ? { ...st, swipe_to: p2 } : st)),
-                                      }));
-                                    });
-                                  }, 500);
-                                });
-                              }}
-                              style={{ padding: '5px 12px', background: '#0284c7', color: 'white', border: 'none', borderRadius: 4, fontSize: 11, fontWeight: 700, cursor: 'pointer' }}
-                            >
-                              🎯 Gắn 2 Điểm Vuốt
-                            </button>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 12, background: '#1c0c29', padding: 16, borderRadius: 8, border: '1px solid #701a75' }}>
+                          <strong style={{ color: '#e9d5ff' }}>Số lần vuốt từng hướng</strong>
+                          <span style={{ color: '#cbd5e1', fontSize: 12 }}>Chạy theo thứ tự lên → xuống → trái → phải. Mỗi lần kéo cùng khoảng cách ngắn.</span>
+                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 10 }}>
+                            {(['up', 'down', 'left', 'right'] as const).map((direction, index) => (
+                              <label key={direction} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: 10, background: '#172033', borderRadius: 6, color: '#f8fafc' }}>
+                                <strong>{['↑ Lên', '↓ Xuống', '← Trái', '→ Phải'][index]}</strong>
+                                <input type="number" min={0} max={100} aria-label={`Số lần vuốt ${['lên', 'xuống', 'trái', 'phải'][index]}`} value={step.swipe_directions?.find(item => item.direction === direction)?.count ?? 0} onChange={event => {
+                                  const value = Math.max(0, Math.min(100, Math.floor(Number(event.target.value) || 0)));
+                                  updateActiveScenario(prev => ({ ...prev, steps: prev.steps.map(st => {
+                                    if (st.id !== step.id) return st;
+                                    const counts = Object.fromEntries((st.swipe_directions || []).map(item => [item.direction, item.count]));
+                                    counts[direction] = Math.min(value, 100 - Object.entries(counts).filter(([key]) => key !== direction).reduce((sum, [, n]) => sum + Number(n), 0));
+                                    const directions = (['up', 'down', 'left', 'right'] as const).filter(key => counts[key] > 0).map(key => ({ direction: key, count: counts[key] }));
+                                    return { ...st, swipe_directions: directions.length ? directions : [{ direction: 'up', count: 0 }], swipe_distance_ratio: 0.12 };
+                                  }) }));
+                                }} style={{ width: 60, padding: 8, color: '#fff', background: '#0b1120', border: '1px solid #64748b', borderRadius: 5 }} />
+                              </label>
+                            ))}
                           </div>
+                          {!step.swipe_directions?.length && <span style={{ color: '#fbbf24', fontSize: 12 }}>Card cũ đang dùng tọa độ cũ; nhập số lần để chuyển sang vuốt theo hướng.</span>}
                         </div>
                       )}
-
                       {step.type === 'delay' && (
                         <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: '#111827', padding: 12, borderRadius: 6, border: '1px solid #374151' }}>
                           <span style={{ color: '#94a3b8', fontSize: 12 }}>Thời gian chờ:</span>
@@ -4053,42 +4357,99 @@ export const ScenarioManager: React.FC<ScenarioManagerProps> = ({
           Tiến trình kịch bản · {execState?.is_running ? 'Đang chạy' : 'Đã dừng'}
         </button>
       )}
-      {!isProgressMinimized && (isProgressPopupOpen || execState?.is_running || runningScenarioId || testingStepId || runError) && (
+      {monitorVisible && (
         <div
+          ref={monitorRef}
           role="presentation"
-          style={{ position: 'fixed', top: 76, right: 12, bottom: 12, zIndex: 20000, width: 'min(440px, calc(100vw - 24px))', pointerEvents: 'none', display: 'flex' }}
+          style={{ position: 'fixed', top: autoMonitor ? '50%' : monitorPosition?.y ?? 76, left: autoMonitor ? '50%' : monitorPosition?.x ?? 12, transform: autoMonitor ? 'translate(-50%, -50%)' : undefined, height: autoMonitor ? 'min(580px, calc(100vh - 32px))' : 'min(720px, calc(100vh - 88px))', zIndex: 20000, width: autoMonitor ? 'min(1000px, calc(100vw - 32px))' : 'min(440px, calc(100vw - 24px))', pointerEvents: 'none', display: 'flex' }}
         >
           <section role="dialog" aria-modal="false" aria-labelledby="progress-history-title" style={{ pointerEvents: 'auto', width: '100%', height: '100%', display: 'flex', flexDirection: 'column', background: '#0b1220', borderLeft: '1px solid #334155', boxShadow: '-20px 0 60px rgba(0,0,0,.55)', color: '#e2e8f0' }}>
-            <header style={{ flexShrink: 0, padding: '18px 20px', background: 'linear-gradient(110deg, #172554, #111827)', borderBottom: '1px solid #334155' }}>
+            <header
+              onPointerDown={(event) => {
+                if (autoMonitor || event.button !== 0 || (event.target as HTMLElement).closest('button')) return;
+                const bounds = monitorRef.current?.getBoundingClientRect();
+                if (!bounds) return;
+                monitorDragRef.current = { x: event.clientX, y: event.clientY, left: bounds.left, top: bounds.top };
+                setMonitorDragging(true);
+                event.preventDefault();
+              }}
+              title="Kéo để di chuyển bảng tiến trình"
+              style={{ flexShrink: 0, padding: '18px 20px', background: 'linear-gradient(110deg, #172554, #111827)', borderBottom: '1px solid #334155', cursor: monitorDragging ? 'grabbing' : 'grab', touchAction: 'none', userSelect: 'none' }}
+            >
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12 }}>
                 <div>
-                  <div style={{ color: '#93c5fd', fontSize: 11, fontWeight: 800, letterSpacing: 1.2 }}>LIVE RUN MONITOR</div>
-                  <h2 id="progress-history-title" style={{ margin: '5px 0 0', fontSize: 20 }}>Tiến trình kịch bản</h2>
-                  <div style={{ marginTop: 6, fontSize: 12, color: '#94a3b8' }}>{execState?.scenario_name || activeScenario?.name || 'Kịch bản'} · {execState?.is_running ? 'Đang chạy' : 'Đã dừng'}</div>
+                  <h2 id="progress-history-title" style={{ margin: '5px 0 0', fontSize: 20 }}>{autoMonitor ? 'Tổng quan chạy tự động' : 'Tiến trình kịch bản'}</h2>
+                  <div style={{ marginTop: 6, fontSize: 12, color: '#94a3b8' }}>{autoMonitor ? 'Thống kê và lịch chạy trong phiên hiện tại' : `${execState?.scenario_name || activeScenario?.name || 'Kịch bản'} · ${execState?.is_running ? 'Đang chạy' : 'Đã dừng'}`}</div>
                 </div>
                 <button type="button" onClick={() => setIsProgressMinimized(true)} aria-label="Đóng tiến trình" title="Thu nhỏ tiến trình, không dừng kịch bản" style={{ color: '#cbd5e1', background: '#1e293b', border: '1px solid #475569', borderRadius: 7, padding: '7px 11px', cursor: 'pointer' }}>Đóng</button>
               </div>
-              <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
+              {!autoMonitor && <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
                 <div style={{ flex: 1, padding: '9px 11px', borderRadius: 8, background: '#0f172a', border: '1px solid #334155' }}><div style={{ color: '#94a3b8', fontSize: 10 }}>VÒNG</div><strong style={{ color: '#fbcfe8' }}>{execState?.current_cycle || 0} / {execState?.total_cycles || 0}</strong></div>
-                <div style={{ flex: 1, padding: '9px 11px', borderRadius: 8, background: '#0f172a', border: '1px solid #334155' }}><div style={{ color: '#94a3b8', fontSize: 10 }}>ĐANG CHẠY</div><strong style={{ color: '#7dd3fc', fontSize: 12 }}>{execState?.current_step_name || (runError ? 'Kết nối lỗi' : 'Chờ bước chạy')}</strong></div>
+                <div style={{ flex: 1, padding: '9px 11px', borderRadius: 8, background: '#0f172a', border: '1px solid #334155' }}><div style={{ color: '#94a3b8', fontSize: 10 }}>ĐANG CHẠY</div><strong style={{ color: '#7dd3fc', fontSize: 12 }}>{execState?.current_step_id ? progressStepName(execState.scenario_id, execState.current_step_id, execState.current_step_name) : (runError ? 'Kết nối lỗi' : 'Chờ bước chạy')}</strong></div>
                 <div style={{ flex: 1, padding: '9px 11px', borderRadius: 8, background: '#0f172a', border: '1px solid #334155' }}><div style={{ color: '#94a3b8', fontSize: 10 }}>LẦN</div><strong style={{ color: '#fde68a' }}>{execState?.current_rep || 0} / {execState?.total_reps || 0}</strong></div>
-              </div>
+              </div>}
             </header>
-            <div style={{ flex: 1, overflowY: 'auto', padding: '14px 18px 20px' }}>
+            <div ref={monitorLogRef} style={{ flex: 1, overflowY: 'auto', padding: '14px 18px 20px' }}>
+              {autoMonitor ? (
+                detailScenarioId ? (() => {
+                  const item = engineProgress?.scenarios.find(s => s.scenario_id === detailScenarioId);
+                  if (!item) return <button type="button" onClick={() => setDetailScenarioId(null)}>Quay lại</button>;
+                  return <div>
+                    <button type="button" onClick={() => setDetailScenarioId(null)} style={{ cursor: 'pointer', padding: 8 }}>← Danh sách kịch bản</button>
+                    <h3>{item.scenario_name}</h3>
+                    {engineProgress?.active_step?.scenario_id === item.scenario_id && <p role="status" style={{ color: '#7dd3fc' }}>Đang chạy: {progressStepName(engineProgress.active_step.scenario_id, engineProgress.active_step.step_id, engineProgress.active_step.step_name)}</p>}
+                    {item.reports.length === 0 && <p>Chưa có lần chạy nào.</p>}
+                    {[...item.reports].reverse().map((report, index) => <section key={report.run_id} style={{ marginBottom: 12, padding: 12, background: '#111c31', borderRadius: 8 }}>
+                      <strong>Lần {item.reports.length - index} · {report.final_status === 'running' ? 'Đang chạy' : report.final_status === 'success' ? 'Thành công' : report.final_status === 'stopped' ? 'Đã dừng' : 'Thất bại'}</strong>
+                      <div style={{ color: '#94a3b8', fontSize: 11 }}>{new Date(report.started_at).toLocaleString('vi-VN')}</div>
+                      {report.steps.map((step, stepIndex) => <div key={`${step.step_id}-${stepIndex}`} style={{ marginTop: 8, color: step.success ? '#86efac' : '#fca5a5' }}>
+                        {step.success ? '✓' : '✕'} {progressStepName(item.scenario_id, step.step_id, step.step_name)}{step.detail && <div style={{ color: '#cbd5e1', fontSize: 11 }}>{renderProgressDetail(step.detail)}</div>}
+                      </div>)}
+                    </section>)}
+                  </div>;
+                })() : <div>
+                  <strong>Tổng quan phiên auto</strong>
+                  {!engineProgress && <p>Đang tải tiến trình...</p>}
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 190px), 1fr))', gap: 8, marginTop: 8 }}>
+                  {engineProgress?.scenarios.filter(item => item.enabled || item.reports.length > 0).map(item => <article key={item.scenario_id} style={{ padding: 8, background: '#111c31', border: '1px solid #334155', borderRadius: 6, minWidth: 0 }}>
+                    <strong style={{ fontSize: 13, overflowWrap: 'anywhere' }}>{item.scenario_name}</strong>
+                    <div style={{ marginTop: 6, fontSize: 12, color: '#cbd5e1' }}>Lần tới: {item.next_run_at ? (() => { const seconds = Math.max(0, Math.ceil((new Date(item.next_run_at).getTime() - Date.now()) / 1000)); const hours = Math.floor(seconds / 3600); const minutes = Math.floor(seconds % 3600 / 60); return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`; })() : item.reports.some(r => r.final_status === 'running') ? 'Đang chạy' : item.interval_minutes === 0 && item.reports.length ? 'Đã chạy trong phiên' : 'Chưa lên lịch'}</div>
+                    <div style={{ marginTop: 6, fontSize: 12 }}><span style={{ color: '#86efac' }}>Thành công: {item.success_count}</span> · <span style={{ color: '#fca5a5' }}>Thất bại: {item.failure_count}</span></div>
+                    <button type="button" onClick={() => setDetailScenarioId(item.scenario_id)} style={{ marginTop: 5, cursor: 'pointer', padding: '3px 8px', fontSize: 11 }}>Chi tiết</button>
+                  </article>)}
+                  </div>
+                </div>
+              ) : <>
+              {runError && <div role="alert" style={{ marginBottom: 12, padding: '10px 12px', border: '1px solid #ef4444', borderRadius: 7, background: '#450a0a', color: '#fecaca', overflowWrap: 'anywhere' }}>{runError}</div>}
+              {execState?.is_running && execState.current_step_id && (
+                <div role="status" style={{ marginBottom: 16, padding: '11px 12px', border: '1px solid #38bdf8', borderRadius: 9, background: '#0c2942', color: '#7dd3fc' }}>
+                  <strong>Đang chạy: {progressStepName(execState.scenario_id, execState.current_step_id, execState.current_step_name)}</strong>
+                  <div style={{ marginTop: 5, fontSize: 11 }}>Vòng {execState.current_cycle} · Lần {execState.current_rep}/{execState.total_reps}</div>
+                </div>
+              )}
               <div style={{ color: '#cbd5e1', fontSize: 12, fontWeight: 800, marginBottom: 12 }}>CÁC BƯỚC ĐÃ CHẠY ({execState?.current_run_steps?.length || 0})</div>
-              {execState?.current_run_steps?.length ? [...execState.current_run_steps].map((item: any, index: number) => (
+              {execState?.current_run_steps?.length ? [...execState.current_run_steps].map((item: any, index: number) => {
+                const matches = scenarios.filter((scenario) => scenario.steps.some((step) => step.id === item.step_id));
+                const scenario = matches.length === 1 ? matches[0] : matches.find((candidate) => candidate.id === execState.scenario_id);
+                const selected = scenario && highlightedStep?.scenarioId === scenario.id && highlightedStep.stepId === item.step_id;
+                return (
                 <article key={`${item.step_id || item.step_name || 'step'}-${item.time || index}-${index}`} style={{ position: 'relative', marginLeft: 8, padding: '0 0 15px 22px', borderLeft: `2px solid ${item.success ? '#16a34a' : '#475569'}` }}>
                   <span style={{ position: 'absolute', left: -7, top: 0, width: 12, height: 12, borderRadius: '50%', background: item.success ? '#22c55e' : '#64748b', boxShadow: item.success ? '0 0 12px rgba(34,197,94,.45)' : 'none' }} />
-                  <div style={{ padding: '11px 12px', border: '1px solid #334155', borderRadius: 9, background: '#111c31' }}>
+                  <button type="button" disabled={!scenario} aria-pressed={Boolean(selected)} title={scenario ? 'Hiển thị card tương ứng' : 'Không tìm thấy card tương ứng'} onClick={() => {
+                    if (!scenario) return;
+                    setSelectedId(scenario.id);
+                    setHighlightedStep({ scenarioId: scenario.id, stepId: item.step_id });
+                  }} style={{ display: 'block', width: '100%', textAlign: 'left', color: 'inherit', padding: '11px 12px', border: `1px solid ${selected ? '#fbbf24' : '#334155'}`, borderRadius: 9, background: '#111c31', cursor: scenario ? 'pointer' : 'not-allowed' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'center' }}>
-                      <strong style={{ color: item.success ? '#86efac' : '#fca5a5', fontSize: 13 }}>{item.success ? '✓' : '•'} {item.step_name || item.step_id || `Bước ${index + 1}`}</strong>
+                      <strong style={{ color: item.success ? '#86efac' : '#fca5a5', fontSize: 13 }}>{item.success ? '✓' : '•'} {progressStepName(scenario?.id, item.step_id, item.step_name || `Bước ${index + 1}`)}</strong>
                       <span style={{ color: '#94a3b8', fontSize: 10, whiteSpace: 'nowrap' }}>{item.time || ''}</span>
                     </div>
-                    <div style={{ marginTop: 6, fontSize: 11, color: '#94a3b8' }}>Vòng {item.cycle ?? '—'} · {item.step_type || 'action'} · {item.duration_sec != null ? `${item.duration_sec}s` : '—'} · {item.branch_name || item.branch_taken || 'Tiếp tục'}</div>
-                    {item.detail && <div style={{ marginTop: 7, fontSize: 12, color: '#cbd5e1', overflowWrap: 'anywhere' }}>{item.detail}</div>}
-                  </div>
+                    <div style={{ marginTop: 6, fontSize: 11, color: '#94a3b8' }}>Vòng {item.cycle ?? '—'}{item.rep != null ? ` · Lần ${item.rep}/${item.total_reps}` : ''} · {item.step_type || 'action'} · {item.duration_sec != null ? `${item.duration_sec}s` : '—'} · {item.branch_name || item.branch_taken || 'Tiếp tục'}</div>
+                    {item.detail && <div style={{ marginTop: 7, fontSize: 12, color: '#cbd5e1', overflowWrap: 'anywhere' }}>{renderProgressDetail(item.detail)}</div>}
+                  </button>
                 </article>
-              )) : <div style={{ padding: 22, textAlign: 'center', color: '#94a3b8', border: '1px dashed #334155', borderRadius: 9 }}>{runError || (execState?.is_running ? 'Đang chờ bước đầu tiên...' : 'Chưa có bước chạy nào.')}</div>}
+              ); }) : <div style={{ padding: 22, textAlign: 'center', color: '#94a3b8', border: '1px dashed #334155', borderRadius: 9 }}>{runError || (execState?.is_running ? 'Đang chờ bước đầu tiên...' : 'Chưa có bước chạy nào.')}</div>}
+              </>}
             </div>
             <footer style={{ flexShrink: 0, padding: '12px 18px', borderTop: '1px solid #334155', color: '#64748b', fontSize: 11 }}>Tiến trình cập nhật trực tiếp · Danh sách cuộn dọc</footer>
           </section>
