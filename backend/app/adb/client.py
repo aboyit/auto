@@ -3,6 +3,7 @@
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Protocol
 import cv2
@@ -130,11 +131,15 @@ class RealADBClient:
         proc_monkey = self._run_cmd(["-s", serial, "shell", "monkey", "-p", package_name, "-c", "android.intent.category.LAUNCHER", "1"])
         if proc_monkey.returncode != 0 or b"Events injected: 1" not in proc_monkey.stdout:
             return False
-        foreground = self._run_cmd(["-s", serial, "shell", "dumpsys", "activity", "activities"])
-        return foreground.returncode == 0 and any(
-            package_name in line and ("mResumedActivity" in line or "topResumedActivity" in line)
-            for line in foreground.stdout.decode("utf-8", errors="replace").splitlines()
-        )
+        for _ in range(5):
+            foreground = self._run_cmd(["-s", serial, "shell", "dumpsys", "activity", "activities"])
+            if foreground.returncode == 0 and any(
+                package_name in line and ("mResumedActivity" in line or "topResumedActivity" in line)
+                for line in foreground.stdout.decode("utf-8", errors="replace").splitlines()
+            ):
+                return True
+            time.sleep(1)
+        return False
 
 class FakeADBClient:
     """Mock ADB Client dung cho Unit Tests khi khong co may that."""

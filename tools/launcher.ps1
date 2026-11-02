@@ -142,8 +142,25 @@ function Stop-StudioServices {
         }
         $services += $listener.OwningProcess
     }
+    # Some Windows hosts report reachable loopback ports but omit their LISTEN rows.
+    if (-not $listeners -and ((Test-Port 8000) -or (Test-Port 5173))) {
+        $main = Join-Path $ProjectDir 'main.py'
+        $vite = Join-Path $ProjectDir 'frontend\node_modules\vite\bin\vite.js'
+        $services += @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+            ($_.Name -match '^pythonw?\.exe$' -and $_.CommandLine -and $_.CommandLine.IndexOf($main, [StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+            ($_.Name -ieq 'node.exe' -and $_.CommandLine -and $_.CommandLine.IndexOf($vite, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and $_.CommandLine -match '\bpreview\b')
+        } | ForEach-Object { $_.ProcessId })
+    }
     foreach ($processId in ($services | Select-Object -Unique)) {
-        Stop-Process -Id $processId -ErrorAction Stop
+        $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction Stop
+        $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$processId" -ErrorAction Stop | Where-Object {
+            $_.Name -match '^pythonw?\.exe$' -and $_.CommandLine -and
+            $_.CommandLine.IndexOf((Join-Path $ProjectDir 'main.py'), [StringComparison]::OrdinalIgnoreCase) -ge 0
+        })
+        foreach ($child in $children) {
+            Stop-Process -Id $child.ProcessId -ErrorAction SilentlyContinue
+        }
+        Stop-Process -Id $processId -ErrorAction SilentlyContinue
         Add-Content -LiteralPath (Join-Path $logs 'launcher.log') -Value "$(Get-Date -Format s) Stopped studio service PID=$processId"
     }
     $deadline = (Get-Date).AddSeconds(10)
@@ -182,8 +199,8 @@ try {
     if (-not $pythonOk) {
         $py = Get-Command py.exe -ErrorAction SilentlyContinue
         $systemPython = Get-Command python.exe -ErrorAction SilentlyContinue
-        if ($py) { $basePython = & $py.Source -3 -c 'import sys; print(sys.executable if sys.version_info >= (3, 11) else "")' 2>$null }
-        if (-not $basePython -and $systemPython) { $basePython = & $systemPython.Source -c 'import sys; print(sys.executable if sys.version_info >= (3, 11) else "")' 2>$null }
+        if ($py) { $basePython = & $py.Source -3 -c 'import sys; sys.exit(1) if sys.version_info < (3, 11) else print(sys.executable)' 2>$null }
+        if (-not $basePython -and $systemPython) { $basePython = & $systemPython.Source -c 'import sys; sys.exit(1) if sys.version_info < (3, 11) else print(sys.executable)' 2>$null }
         if (-not $basePython) { throw 'Python >=3.11 is required. Install Python and run again.' }
         Set-LauncherProgress 'Dang sua moi truong Python...'
         Invoke-SetupCommand $basePython @('-m', 'venv', '--upgrade', (Join-Path $ProjectDir '.venv')) $ProjectDir 'Cannot create/repair .venv.'
